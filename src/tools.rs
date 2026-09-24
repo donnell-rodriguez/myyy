@@ -1,4 +1,4 @@
-use std::{collections::HashMap, pin::Pin};
+use std::{collections::HashMap, pin::Pin, sync::Arc};
 
 use serde::Deserialize;
 use tokio::process::Command;
@@ -68,7 +68,7 @@ trait ToolExecutor: Send + Sync {
 }
 
 struct ToolRegistry {
-    tools: HashMap<String, Box<dyn ToolExecutor>>,
+    tools: HashMap<String, Arc<dyn ToolExecutor>>,
 }
 
 impl ToolRegistry {
@@ -83,16 +83,20 @@ impl ToolRegistry {
         T: ToolExecutor + 'static,
     {
         let name = tool.tool_name().to_string();
-        let previous = self.tools.insert(name.clone(), Box::new(tool));
+        let previous = self.tools.insert(name.clone(), Arc::new(tool));
         assert!(previous.is_none(), "重复注册工具：{name}");
         println!("[ToolRegistry] 已注册工具：{name}");
+    }
+
+    // 查找并克隆句柄
+    fn tool(&self, name: &str) -> Option<Arc<dyn ToolExecutor>> {
+        self.tools.get(name).map(Arc::clone)
     }
 
     async fn dispatch(&self, call: ToolCall) -> Result<ToolResult, String> {
         let tool_name = call.name.clone();
         let tool = self
-            .tools
-            .get(&tool_name)
+            .tool(&tool_name)
             .ok_or_else(|| format!("未注册工具：{tool_name}"))?;
         println!("[ToolRegistry] 路由到工具：{tool_name}");
         tool.handle(call).await

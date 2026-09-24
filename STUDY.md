@@ -43,3 +43,31 @@ cargo run
 ```text
 /quit
 ```
+
+## MVP 12：Shared Tool Ownership
+
+目标：让工具注册表和工具执行流程能够同时拥有同一个工具，为后续独立异步任务做准备。
+
+数据流：
+
+```text
+ToolRegistry
+  -> Arc<dyn ToolExecutor>
+  -> tool() 调用 Arc::clone
+  -> dispatch 获得独立共享句柄
+  -> ToolExecutor::handle
+```
+
+Rust 概念：
+
+- `Arc<T>`：通过原子引用计数共享同一个值。
+- `Arc::clone`：增加引用计数，不复制底层工具。
+- `Arc<dyn ToolExecutor>`：共享一个经过 trait object 类型擦除的工具执行器。
+
+生产源码对应：Codex 的 `ToolRegistry` 使用 `Arc<dyn CoreToolRuntime>` 保存并返回工具运行时。
+
+本阶段仍然省略：独立 Tokio 任务、取消令牌、并行工具、sandbox 和生产遥测。
+
+验收结果：`cargo fmt --check`、`cargo check --locked --offline` 和 `请执行 pwd` 完整 Agent 回路均通过。
+
+下一阶段：MVP 13，使用独立异步任务执行工具调用。
