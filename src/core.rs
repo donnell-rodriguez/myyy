@@ -1,13 +1,13 @@
 use crate::history::{ConversationHistory, ConversationItem};
 use crate::model::{FakeModel, ModelOutput};
 use crate::protocol::UserInput;
-use crate::tools::ToolRouter;
+use crate::tools::{ToolCallRuntime, ToolRouter};
 
 // 本轮状态
 // 每一轮 Agent 工作都有本轮允许使用的一组工具。
 struct TurnContext {
     turn_id: u64,
-    tool_router: ToolRouter,
+    tool_runtime: ToolCallRuntime,
 }
 
 // 读取输入
@@ -110,16 +110,17 @@ impl RegularTask {
                     // 如果出现的是工具，就进行分发
                     let call = ToolRouter::build_tool_call(name.clone(), arguments);
                     // 去调用工具，然后将工具调用跟成功不成功一起写出来。
-                    let (success, tool_output) = match context.tool_router.dispatch(call).await {
-                        Ok(result) => {
-                            println!("[ToolResult] {}", result.output);
-                            (true, result.output)
-                        }
-                        Err(error) => {
-                            println!("[ToolError] {error}");
-                            (false, error)
-                        }
-                    };
+                    let (success, tool_output) =
+                        match context.tool_runtime.handle_tool_call(call).await {
+                            Ok(result) => {
+                                println!("[ToolResult] {}", result.output);
+                                (true, result.output)
+                            }
+                            Err(error) => {
+                                println!("[ToolError] {error}");
+                                (false, error)
+                            }
+                        };
                     session.history.push(ConversationItem::ToolResult {
                         name,
                         output: tool_output,
@@ -174,7 +175,7 @@ impl Session {
         self.next_turn_id += 1;
         let turn_context = TurnContext {
             turn_id: self.next_turn_id,
-            tool_router: ToolRouter::new(),
+            tool_runtime: ToolCallRuntime::new(ToolRouter::new()),
         };
         println!(
             "[Core/Session {}] 创建 TurnContext(turn_id={})",

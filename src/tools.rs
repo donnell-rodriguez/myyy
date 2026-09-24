@@ -36,6 +36,8 @@ pub struct ToolResult {
 //         }
 //     }
 // }
+
+// ToolRouter：接收并转交工具调用
 pub struct ToolRouter {
     registry: ToolRegistry,
 }
@@ -61,12 +63,14 @@ impl ToolRouter {
 // 所以统一装入 Box，并通过 dyn Future 隐藏具体类型。
 type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send + 'a>>;
 // 定义一个trait叫做ToolExecutor
+// ToolExecutor：执行具体工具行为
 trait ToolExecutor: Send + Sync {
     fn tool_name(&self) -> &'static str;
     // 执行一次工具调用。
     fn handle<'a>(&'a self, call: ToolCall) -> ToolFuture<'a>;
 }
 
+// ToolRegistry：根据名称找到工具
 struct ToolRegistry {
     tools: HashMap<String, Arc<dyn ToolExecutor>>,
 }
@@ -100,6 +104,34 @@ impl ToolRegistry {
             .ok_or_else(|| format!("未注册工具：{tool_name}"))?;
         println!("[ToolRegistry] 路由到工具：{tool_name}");
         tool.handle(call).await
+    }
+}
+
+// ToolCallRuntime：管理一次工具任务的生命周期
+#[derive(Clone)]
+pub struct ToolCallRuntime {
+    router: Arc<ToolRouter>,
+}
+impl ToolCallRuntime {
+    pub fn new(router: ToolRouter) -> Self {
+        Self {
+            router: Arc::new(router),
+        }
+    }
+
+    pub async fn handle_tool_call(&self, call: ToolCall) -> Result<ToolResult, String> {
+        let router = Arc::clone(&self.router);
+        println!("[ToolCallRuntime] 创建独立工具任务");
+        let task_handle = tokio::spawn(async move {
+            println!("[ToolCallRuntime] 工具任务开始");
+            router.dispatch(call).await
+        });
+
+        let result = task_handle
+            .await
+            .map_err(|error| format!("工具任务连接失败：{error}"))?;
+        println!("[ToolCallRuntime] 工具任务结束");
+        result
     }
 }
 
