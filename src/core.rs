@@ -2,12 +2,19 @@ use crate::history::{ConversationHistory, ConversationItem};
 use crate::model::{FakeModel, ModelOutput};
 use crate::protocol::UserInput;
 use crate::tools::{ToolCallRuntime, ToolRouter};
+use tokio::time::{Duration, sleep};
+use tokio_util::sync::CancellationToken;
 
 // 本轮状态
 // 每一轮 Agent 工作都有本轮允许使用的一组工具。
+//本轮运行需要的配置和工具
 struct TurnContext {
     turn_id: u64,
     tool_runtime: ToolCallRuntime,
+}
+// 当前正在执行的任务及其生命周期控制
+struct ActiveTurn {
+    cancellation_token: CancellationToken,
 }
 
 // 读取输入
@@ -21,7 +28,13 @@ impl RegularTask {
     fn new() -> Self {
         Self
     }
-    async fn run(&self, session: &mut Session, context: &TurnContext, input: Vec<UserInput>) {
+    async fn run(
+        &self,
+        session: &mut Session,
+        context: &TurnContext,
+        input: Vec<UserInput>,
+        cancellation_token: CancellationToken,
+    ) {
         println!(
             "[Core/RegularTask] session={} turn={} 开始",
             session.session_id, context.turn_id
@@ -111,7 +124,10 @@ impl RegularTask {
                     let call = ToolRouter::build_tool_call(name.clone(), arguments);
                     // 去调用工具，然后将工具调用跟成功不成功一起写出来。
                     let (success, tool_output) =
-                        match context.tool_runtime.handle_tool_call(call).await {
+                    // 由于我们当前是工具的取消，所以要放在这里, 使用regulartask子令牌
+                    // 父令牌取消时，所有子令牌都会收到取消信号。
+// 反过来，某个子令牌取消，不会取消整个父任务
+                        match context.tool_runtime.handle_tool_call(call, cancellation_token.child_token()).await {
                             Ok(result) => {
                                 println!("[ToolResult] {}", result.output);
                                 (true, result.output)
@@ -159,6 +175,7 @@ pub struct Session {
     next_turn_id: u64,
     model: FakeModel,
     history: ConversationHistory,
+    active_turn: Option<ActiveTurn>,
 }
 
 impl Session {
@@ -168,11 +185,34 @@ impl Session {
             next_turn_id: 0,
             model: FakeModel::new(),
             history: ConversationHistory::new(),
+            active_turn: None,
         }
     }
 
     pub async fn start_turn(&mut self, input: Vec<UserInput>) {
         self.next_turn_id += 1;
+        let should_auto_cancel = input.iter().any(|item| match item {
+            UserInput::Text { text } => text.contains("等待"),
+        });
+        self.active_turn = Some(ActiveTurn {
+            cancellation_token: CancellationToken::new(),
+        });
+        let cancellation_token = self
+            .active_turn
+            .as_ref()
+            .expect("activeturn 刚刚创建，必然存在")
+            .cancellation_token
+            .clone();
+
+        if should_auto_cancel {
+            let cancellation_token = cancellation_token.clone();
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(500)).await;
+                println!("[Session/ActiveTurn] 发出取消信号");
+                cancellation_token.cancel();
+            });
+        }
+
         let turn_context = TurnContext {
             turn_id: self.next_turn_id,
             tool_runtime: ToolCallRuntime::new(ToolRouter::new()),
@@ -182,6 +222,10 @@ impl Session {
             self.session_id, turn_context.turn_id
         );
         // 在此交给我们的reglartask
-        RegularTask::new().run(self, &turn_context, input).await;
+        RegularTask::new()
+            .run(self, &turn_context, input, cancellation_token.child_token())
+            .await;
+        self.active_turn = None;
+        println!("[Core/Session] ActiveTurn 已清理");
     }
 }

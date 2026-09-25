@@ -121,25 +121,32 @@ impl ToolCallRuntime {
         }
     }
 
-    pub async fn handle_tool_call(&self, call: ToolCall) -> Result<ToolResult, String> {
+    pub async fn handle_tool_call(
+        &self,
+        call: ToolCall,
+        cancellation_token: CancellationToken,
+    ) -> Result<ToolResult, String> {
         let router = Arc::clone(&self.router);
-
-        let should_auto_cancel = call.arguments.contains(r#""cmd":"wait""#);
-        let cancellation_token = CancellationToken::new();
-        if should_auto_cancel {
-            let cancellation_token = cancellation_token.clone();
-            tokio::spawn(async move {
-                sleep(Duration::from_millis(500)).await;
-                println!("[Cancellation] 发出取消信号");
-                cancellation_token.cancel();
-            });
-        }
+        // // 异步一
+        // let should_auto_cancel = call.arguments.contains(r#""cmd":"wait""#);
+        // // 可以被很多异步任务共同观察的取消信号灯
+        // let cancellation_token = CancellationToken::new();
+        // if should_auto_cancel {
+        //     let cancellation_token = cancellation_token.clone();
+        //     tokio::spawn(async move {
+        //         sleep(Duration::from_millis(500)).await;
+        //         println!("[Cancellation] 发出取消信号");
+        //         // 不会自动终止代码，只会通知代码“应该取消了
+        //         cancellation_token.cancel();
+        //     });
+        // }
+        // 异步二
         println!("[ToolCallRuntime] 创建独立工具任务");
         let mut task_handle = tokio::spawn(async move {
             println!("[ToolCallRuntime] 工具任务开始");
             router.dispatch(call).await
         });
-
+        // 对于创建的异步来说，谁先完成谁拿到结果
         tokio::select! {
                 join_result = &mut task_handle=>{
                     let result = join_result.map_err(|error| {
@@ -148,24 +155,16 @@ impl ToolCallRuntime {
                     println!("[ToolCallRuntime] 工具任务结束");
                     result
                 },
+
+                // 取消的这个信号收到
                 _ = cancellation_token.cancelled()=> {
-                    println!(
-                    "[ToolCallRuntime] \
-                     收到取消信号，终止工具任务"
-                );
+                    println!("[ToolCallRuntime]收到取消信号，终止工具任务");
+                // 处理取消后的结果
                 task_handle.abort();
                 match task_handle.await {
                      Ok(result)=> result,
-                     Err(error) if error.is_cancelled()=>{
-                        Err("工具任务已取消"
-                                .to_string()
-                        )
-                     }
-                     Err(error)=>{
-                        Err(format!(
-                            "取消工具任务失败：{error}"
-                        ))
-                     }
+                     Err(error) if error.is_cancelled()=>{Err("工具任务已取消".to_string())}
+                     Err(error)=>{Err(format!("取消工具任务失败：{error}"))}
                 }
 
             }
@@ -216,6 +215,7 @@ impl ExecCommandHandler {
                 return Err(reason);
             }
         }
+        // 具体执行
         if args.cmd == "wait" {
             println!("[ExecCommandHandler] 开始等待 5 秒");
             sleep(Duration::from_secs(5)).await;
@@ -242,7 +242,7 @@ impl ToolExecutor for ExecCommandHandler {
     fn tool_name(&self) -> &'static str {
         "exec_command"
     }
-
+    // 这里来到了具体执行的工具这个阶段了
     fn handle<'a>(&'a self, call: ToolCall) -> ToolFuture<'a> {
         Box::pin(async move { self.execute(call).await })
     }
