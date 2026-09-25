@@ -1,7 +1,9 @@
-use std::{collections::HashMap, pin::Pin, sync::Arc};
+use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
 
 use serde::Deserialize;
 use tokio::process::Command;
+use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 #[derive(Debug)]
 pub struct ToolCall {
     pub name: String,
@@ -45,7 +47,7 @@ pub struct ToolRouter {
 impl ToolRouter {
     pub fn new() -> Self {
         let mut registry = ToolRegistry::new();
-        // 讲其中一个工具给推送进来
+        // 把其中一个工具给推送进来
         registry.register(ExecCommandHandler::new());
         Self { registry }
     }
@@ -121,17 +123,53 @@ impl ToolCallRuntime {
 
     pub async fn handle_tool_call(&self, call: ToolCall) -> Result<ToolResult, String> {
         let router = Arc::clone(&self.router);
+
+        let should_auto_cancel = call.arguments.contains(r#""cmd":"wait""#);
+        let cancellation_token = CancellationToken::new();
+        if should_auto_cancel {
+            let cancellation_token = cancellation_token.clone();
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(500)).await;
+                println!("[Cancellation] 发出取消信号");
+                cancellation_token.cancel();
+            });
+        }
         println!("[ToolCallRuntime] 创建独立工具任务");
-        let task_handle = tokio::spawn(async move {
+        let mut task_handle = tokio::spawn(async move {
             println!("[ToolCallRuntime] 工具任务开始");
             router.dispatch(call).await
         });
 
-        let result = task_handle
-            .await
-            .map_err(|error| format!("工具任务连接失败：{error}"))?;
-        println!("[ToolCallRuntime] 工具任务结束");
-        result
+        tokio::select! {
+                join_result = &mut task_handle=>{
+                    let result = join_result.map_err(|error| {
+                        format!("工具任务连接失败：{error}")
+                    })?;
+                    println!("[ToolCallRuntime] 工具任务结束");
+                    result
+                },
+                _ = cancellation_token.cancelled()=> {
+                    println!(
+                    "[ToolCallRuntime] \
+                     收到取消信号，终止工具任务"
+                );
+                task_handle.abort();
+                match task_handle.await {
+                     Ok(result)=> result,
+                     Err(error) if error.is_cancelled()=>{
+                        Err("工具任务已取消"
+                                .to_string()
+                        )
+                     }
+                     Err(error)=>{
+                        Err(format!(
+                            "取消工具任务失败：{error}"
+                        ))
+                     }
+                }
+
+            }
+        }
     }
 }
 
@@ -148,7 +186,7 @@ enum ApprovalDecision {
 struct ApprovalPolicy;
 impl ApprovalPolicy {
     fn review(&self, args: &ExecCommandArgs) -> ApprovalDecision {
-        if args.cmd == "pwd" {
+        if args.cmd == "pwd" || args.cmd == "wait" {
             ApprovalDecision::Approved
         } else {
             ApprovalDecision::Denied(format!("本阶段只允许pwd， 拒绝命令：{}", args.cmd))
@@ -172,14 +210,18 @@ impl ExecCommandHandler {
         // 审批合法性
         match self.approval_policy.review(&args) {
             ApprovalDecision::Approved => {
-                println!(
-                    "[ApprovalPolicy] \
-                     已批准只读命令：pwd"
-                );
+                println!("[ApprovalPolicy] 已批准命令：{}", args.cmd);
             }
             ApprovalDecision::Denied(reason) => {
                 return Err(reason);
             }
+        }
+        if args.cmd == "wait" {
+            println!("[ExecCommandHandler] 开始等待 5 秒");
+            sleep(Duration::from_secs(5)).await;
+            return Ok(ToolResult {
+                output: "等待完成 ".to_string(),
+            });
         }
         // 创建的是“进程启动配置”，此时通常还没有真正启动进程。当前异步任务等待 pwd 运行完成，但不会阻塞整个 Tokio 运行时。
         let output = Command::new("/bin/pwd").output().await.map_err(|error| {

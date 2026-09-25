@@ -30,6 +30,13 @@ impl FakeModel {
         };
         // 判断最后一个item的情况，分别进行处理， 这里是模拟modeloutput的情况
         match last_item {
+            // 慢工具
+            ConversationItem::UserMessage { text } if text.contains("等待") => {
+                ModelOutput::ToolCall {
+                    name: "exec_command".to_string(),
+                    arguments: r#"{"cmd":"wait"}"#.to_string(),
+                }
+            }
             // pwd 的命令
             ConversationItem::UserMessage { text } if text.contains("pwd") => {
                 ModelOutput::ToolCall {
