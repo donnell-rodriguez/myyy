@@ -38,10 +38,14 @@ impl UserMessage {
 #[derive(Debug)]
 pub enum AppCommand {
     UserTurn { items: Vec<UserInput> },
+    Interrupt,
 }
 
 impl AppCommand {
     pub fn user_turn(items: Vec<UserInput>) -> Self {
         Self::UserTurn { items }
+    }
+    pub fn interrupt() -> Self {
+        Self::Interrupt
     }
 }

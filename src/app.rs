@@ -35,6 +35,15 @@ impl App {
                 match maybe_event {
                     Some(TuiEvent::Submitted(text)) => {
                         println!("1. 收到 TUI 事件：{text:?}");
+                        if text.trim() == "/cancel" {
+                            println!("[App] 发送 Interrupt 命令");
+                            if self.app_server.submit(AppCommand::interrupt()).await.is_err()
+                            {
+                                println!("[App] App Server 已关闭");
+                                break;
+                            }
+                            continue;
+                        }
 
                         // 第一次变形：终端字符串 -> TUI 层整理后的 UserMessage。
                         let user_message = UserMessage::from(text);

@@ -1,5 +1,7 @@
 use crate::core::Session;
 use crate::protocol::AppCommand;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 pub struct AppServerSession {
     // App 持有发送端；接收端由 App Server 后台任务独占。
@@ -22,7 +24,9 @@ pub fn start() -> AppServerSession {
     // App Server 在独立 Tokio 任务中持续接收并处理 AppCommand。
     // 当前 MVP 直接打印输入；下一阶段会把 `items` 转交给 Core Session。
     tokio::spawn(async move {
-        let mut session = Session::new();
+        let session = Session::new();
+        let session_control = session.control();
+        let session = Arc::new(Mutex::new(session));
         while let Some(command) = command_rx.recv().await {
             match command {
                 AppCommand::UserTurn { items } => {
@@ -39,8 +43,19 @@ pub fn start() -> AppServerSession {
                          转交给 Core"
                     );
 
+                    let session = Arc::clone(&session);
+
                     //把所有权交给了start_turn
-                    session.start_turn(items).await;
+                    tokio::spawn(async move {
+                        session.lock().await.start_turn(items).await;
+                    });
+                }
+                AppCommand::Interrupt => {
+                    println!(
+                        "[App Server] 收到 Interrupt，\
+                         转交给 Core"
+                    );
+                    session_control.interrupt().await;
                 }
             }
         }
