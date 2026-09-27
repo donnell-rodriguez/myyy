@@ -3,10 +3,11 @@ use crate::model::{FakeModel, ModelOutput};
 use crate::protocol::UserInput;
 use crate::tools::{ToolCallRuntime, ToolRouter};
 // use tokio::time::{Duration, sleep};
+use crate::protocol::CoreEvent;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-
 // 本轮状态
 // 每一轮 Agent 工作都有本轮允许使用的一组工具。
 //本轮运行需要的配置和工具
@@ -220,7 +221,11 @@ impl Session {
         }
     }
 
-    pub async fn start_turn(&mut self, input: Vec<UserInput>) {
+    pub async fn start_turn(
+        &mut self,
+        input: Vec<UserInput>,
+        event_tx: mpsc::UnboundedSender<CoreEvent>,
+    ) {
         self.next_turn_id += 1;
         // let should_auto_cancel = input.iter().any(|item| match item {
         //     UserInput::Text { text } => text.contains("等待"),
@@ -259,14 +264,31 @@ impl Session {
             "[Core/Session {}] 创建 TurnContext(turn_id={})",
             self.session_id, turn_context.turn_id
         );
+        let _ = event_tx.send(CoreEvent::TurnStarted {
+            turn_id: turn_context.turn_id,
+        });
 
         // 在此交给我们的reglartask
         RegularTask::new()
             .run(self, &turn_context, input, cancellation_token.child_token())
             .await;
+        let was_cancelled = cancellation_token.is_cancelled();
 
         *self.active_turn.lock().await = None;
 
         println!("[Core/Session] ActiveTurn 已清理");
+
+        let terminal_event = if was_cancelled {
+            CoreEvent::TurnAborted {
+                turn_id: turn_context.turn_id,
+                reason: "interrupted".to_string(),
+            }
+        } else {
+            CoreEvent::TurnCompleted {
+                turn_id: turn_context.turn_id,
+            }
+        };
+
+        let _ = event_tx.send(terminal_event);
     }
 }

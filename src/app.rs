@@ -1,5 +1,6 @@
 use crate::app_server::AppServerSession;
 use crate::protocol::AppCommand;
+use crate::protocol::CoreEvent;
 use crate::protocol::TuiEvent;
 use crate::protocol::UserMessage;
 use std::time::Duration;
@@ -82,7 +83,39 @@ impl App {
             _ = system_tick.tick() =>{
                 println!("【系统事件】定时刷新")
             }
+            maybe_event = self.app_server.recv_event() =>{
+                match maybe_event {
+                    Some(CoreEvent::TurnStarted {turn_id})=>{
+                        println!(
+                "[App/Event] \
+                 TurnStarted(turn_id={turn_id})"
+            );
+            }
+                    Some(CoreEvent::TurnCompleted {turn_id})=>{
+                        println!(
+                "[App/Event] \
+                 TurnCompleted(turn_id={turn_id})"
+            );
+            }
+                Some(CoreEvent::TurnAborted {
+                    turn_id, reason
+                })=>{
+                    println!(
+                        "[App/Event] \
+                        TurnAborted(\
+                        turn_id={turn_id}, \
+                        reason={reason})"
+             );
+            }
+                None =>{
+                    println!(
+                        "[App] App Server 事件通道已关闭"
+                    );
+                    break;
                 }
+                    }
+            }
+            }
         }
     }
 }

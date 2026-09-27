@@ -49,3 +49,10 @@ impl AppCommand {
         Self::Interrupt
     }
 }
+
+#[derive(Debug)]
+pub enum CoreEvent {
+    TurnStarted { turn_id: u64 },
+    TurnCompleted { turn_id: u64 },
+    TurnAborted { turn_id: u64, reason: String },
+}
