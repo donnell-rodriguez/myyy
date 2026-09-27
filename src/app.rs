@@ -3,6 +3,7 @@ use crate::protocol::AppCommand;
 use crate::protocol::CoreEvent;
 use crate::protocol::TuiEvent;
 use crate::protocol::UserMessage;
+use crate::streaming::StreamState;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -11,6 +12,7 @@ pub struct App {
     event_rx: mpsc::UnboundedReceiver<TuiEvent>,
     // 向进程内 App Server 提交 AppCommand 的客户端句柄。
     app_server: AppServerSession,
+    stream_state: StreamState,
 }
 
 impl App {
@@ -19,6 +21,7 @@ impl App {
         Self {
             event_rx,
             app_server,
+            stream_state: StreamState::new(),
         }
     }
 
@@ -83,6 +86,7 @@ impl App {
             _ = system_tick.tick() =>{
                 println!("【系统事件】定时刷新")
             }
+            // 从core当中收到event， 对event进行match， 然后看具体的事情情况
             maybe_event = self.app_server.recv_event() =>{
                 match maybe_event {
                     Some(CoreEvent::TurnStarted {turn_id})=>{
@@ -90,6 +94,46 @@ impl App {
                 "[App/Event] \
                  TurnStarted(turn_id={turn_id})"
             );
+            }
+            Some(CoreEvent::AgentMessageDelta{
+                turn_id, delta
+            })=>{
+            // println!(
+            //     "[App/Event] AgentMessageDelta(\
+            //     turn_id={turn_id}): {delta:?}"
+            // );
+            match self.stream_state.push_delta(turn_id, delta) {
+                Ok(current_text) =>{
+                    println!("[App/Streaming] turn_id={turn_id}, current={current_text:?}");
+                }
+                Err(error)=>{
+                    println!("[App/StreamingError] {error}");
+                }
+            }
+            }
+            Some(CoreEvent::AgentMessage{
+                turn_id, text
+            })=>{
+            //     println!(
+            //     "[App/Event] \
+            //     AgentMessage(turn_id={turn_id}): chars={}", text.chars().count()
+            // );
+            match self.stream_state.finish(turn_id, text){
+                Ok(completion)=>{
+                    println!(
+                "[FinalAssistantMessage] {}",
+                completion.text
+            );
+
+            println!(
+                "[App/Streaming] deltas_matched={}",
+                completion.deltas_matched
+            );
+                }
+                Err(error)=>{
+                    println!("[App/StreamingError] {error}");
+                }
+            }
             }
                     Some(CoreEvent::TurnCompleted {turn_id})=>{
                         println!(

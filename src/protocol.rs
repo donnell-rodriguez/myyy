@@ -53,6 +53,9 @@ impl AppCommand {
 #[derive(Debug)]
 pub enum CoreEvent {
     TurnStarted { turn_id: u64 },
+    // 增量
+    AgentMessageDelta { turn_id: u64, delta: String },
+    AgentMessage { turn_id: u64, text: String },
     TurnCompleted { turn_id: u64 },
     TurnAborted { turn_id: u64, reason: String },
 }

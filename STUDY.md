@@ -101,3 +101,35 @@ Rust 概念：
 验收结果：格式与编译通过；`请执行 pwd` 经独立任务成功执行；`请执行 ls` 经独立任务后仍被审批策略拒绝。
 
 下一阶段：MVP 14，为工具任务增加可观察的取消信号与取消结果。
+
+## MVP 18–20：Core Events and Streaming State
+
+目标：让 Core 不再直接展示最终回答，而是通过事件通道把 Turn 生命周期、Agent 消息增量和完整消息交给 App，并由 App 持有 `StreamState` 累积流式文本。
+
+数据流：
+
+```text
+Core
+  -> CoreEvent::TurnStarted
+  -> CoreEvent::AgentMessageDelta × N
+  -> CoreEvent::AgentMessage
+  -> CoreEvent::TurnCompleted / TurnAborted
+  -> App Server event channel
+  -> App::StreamState
+  -> FinalAssistantMessage
+```
+
+Rust 概念：
+
+- `mpsc::UnboundedSender<CoreEvent>`：Core 向界面异步发送事件。
+- `Option<u64>`：记录当前流属于哪个 Turn。
+- `String::push_str`：把消息增量依次拼接起来。
+- `std::mem::take`：取出累积结果，同时清空流状态。
+
+生产源码对应：Codex Core 发送 Agent 消息增量和完成事件；TUI 的流式状态负责累积、渲染，并在完整消息到达后完成合并。
+
+本阶段仍然省略：真实模型响应流、`item_id`、Markdown 增量渲染、流队列背压，以及 UserTurn 与立即 Interrupt 之间的启动竞态治理。
+
+验收结果：`cargo fmt --check`、`cargo check`、`cargo test`、`请执行 pwd` 流式回路和 ActiveTurn 建立后的 `/cancel` 回路均通过；正常完成与取消完成时 `deltas_matched=true`。
+
+下一阶段：MVP 21，为 `StreamState` 编写单元测试，验证正常完成、Turn 不匹配和完成后状态复用。

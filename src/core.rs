@@ -63,6 +63,7 @@ impl RegularTask {
         context: &TurnContext,
         input: Vec<UserInput>,
         cancellation_token: CancellationToken,
+        event_tx: &mpsc::UnboundedSender<CoreEvent>,
     ) {
         println!(
             "[Core/RegularTask] session={} turn={} 开始",
@@ -128,7 +129,21 @@ impl RegularTask {
             let output = session.model.respond(session.history.items()).await;
             match output {
                 ModelOutput::AssistantMessage { text } => {
-                    println!("[FinalAssistantMessage] {text}");
+                    // println!("[FinalAssistantMessage] {text}");
+                    // 增量
+                    for character in text.chars() {
+                        let _ = event_tx.send(CoreEvent::AgentMessageDelta {
+                            turn_id: context.turn_id,
+                            delta: character.to_string(),
+                        });
+                        tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+                    }
+                    // 我们这里不进行打印，而是通过event_tx发送出去, 上面已经增量了，这里表示的就是说是agent消息已经结束了。
+                    let _ = event_tx.send(CoreEvent::AgentMessage {
+                        turn_id: context.turn_id,
+                        text: text.clone(),
+                    });
+
                     // 要将输出的存储到history当中去
                     session
                         .history
@@ -264,20 +279,27 @@ impl Session {
             "[Core/Session {}] 创建 TurnContext(turn_id={})",
             self.session_id, turn_context.turn_id
         );
+        // 开始了，那么就要讲event_tx发送给app
         let _ = event_tx.send(CoreEvent::TurnStarted {
             turn_id: turn_context.turn_id,
         });
 
         // 在此交给我们的reglartask
         RegularTask::new()
-            .run(self, &turn_context, input, cancellation_token.child_token())
+            .run(
+                self,
+                &turn_context,
+                input,
+                cancellation_token.child_token(),
+                &event_tx,
+            )
             .await;
         let was_cancelled = cancellation_token.is_cancelled();
 
         *self.active_turn.lock().await = None;
 
         println!("[Core/Session] ActiveTurn 已清理");
-
+        // 如果出现了取消的情况，那么也要把这个信号发出去。发到app上
         let terminal_event = if was_cancelled {
             CoreEvent::TurnAborted {
                 turn_id: turn_context.turn_id,

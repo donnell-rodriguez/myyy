@@ -4,6 +4,7 @@ mod core;
 mod history;
 mod model;
 mod protocol;
+mod streaming;
 mod tools;
 mod tui;
 use crate::app::App;
