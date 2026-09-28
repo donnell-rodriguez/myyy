@@ -133,3 +133,28 @@ Rust 概念：
 验收结果：`cargo fmt --check`、`cargo check`、`cargo test`、`请执行 pwd` 流式回路和 ActiveTurn 建立后的 `/cancel` 回路均通过；正常完成与取消完成时 `deltas_matched=true`。
 
 下一阶段：MVP 21，为 `StreamState` 编写单元测试，验证正常完成、Turn 不匹配和完成后状态复用。
+
+## MVP 21：Stream State Tests
+
+目标：把流式消息状态的不变量写成可重复执行的单元测试，不再只依赖手动观察终端输出。
+
+被保护的不变量：
+
+- 同一个 Turn 的多个增量必须按顺序合并，并与最终完整消息一致。
+- 另一个 Turn 的增量不能混入当前活动消息流。
+- 一条消息完成后，`StreamState` 必须清空并可供下一 Turn 复用。
+
+Rust 概念：
+
+- `#[cfg(test)]`：只在测试构建中编译测试模块。
+- `#[test]`：把普通同步函数注册为 Rust 测试。
+- `PartialEq` 与 `Eq`：允许对完整的 `StreamCompletion` 值执行相等比较。
+- `unwrap_err()`：测试预期失败分支并取得错误值。
+
+生产源码对应：Codex 使用测试固定流式增量、完整消息和 Turn 归属等状态不变量；教学项目先对纯状态机做确定性单元测试。
+
+本阶段仍然省略：真实模型流、`item_id`、多条并发消息，以及 UserTurn 与立即 Interrupt 之间的启动竞态修复。
+
+验收结果：`cargo fmt --check` 与 `cargo test` 通过；3 个测试全部成功。
+
+下一阶段：MVP 22，用确定性测试复现并修复“UserTurn 刚被接受时立即取消可能丢失”的竞态。
