@@ -31,6 +31,23 @@ impl StreamState {
         self.accumulated_text.push_str(&delta);
         Ok(&self.accumulated_text)
     }
+    pub fn abort(&mut self, turn_id: u64) -> Result<Option<String>, String> {
+        match self.active_turn_id {
+            // 没有活动流
+            None => Ok(None),
+            // 终止的正是当前活动流
+            Some(active_turn_id) if active_turn_id == turn_id => {
+                self.active_turn_id = None;
+                let discarded_text = std::mem::take(&mut self.accumulated_text);
+                Ok(Some(discarded_text))
+            }
+            // 终止事件属于另一个 Turn
+            Some(active_turn_id) => Err(format!(
+                "收到 turn {turn_id} 的终止事件，\
+             但当前活动流属于 turn {active_turn_id}"
+            )),
+        }
+    }
     pub fn finish(
         &mut self,
         turn_id: u64,
@@ -99,5 +116,31 @@ mod tests {
                 deltas_matched: true,
             }
         );
+    }
+
+    #[test]
+    fn abort_discards_partial_stream_and_allows_reuse() {
+        // Turn 1 部分流
+        // → abort(1)
+        // → 状态清空
+        // → Turn 2 可以正常开始并完成
+        let mut state = StreamState::new();
+        state.push_delta(1, "未完成".to_string()).unwrap();
+        assert_eq!(state.abort(1), Ok(Some("未完成".to_string())));
+        assert_eq!(state.push_delta(2, "下一轮".to_string()), Ok("下一轮"));
+        assert_eq!(
+            state.finish(2, "下一轮".to_string()).unwrap(),
+            StreamCompletion {
+                text: "下一轮".to_string(),
+                deltas_matched: true,
+            }
+        );
+    }
+    #[test]
+    fn abort_without_active_stream_is_noop() {
+        // → 还没有任何 Delta
+        // → TurnAborted
+        let mut state = StreamState::new();
+        assert_eq!(state.abort(1), Ok(None));
     }
 }

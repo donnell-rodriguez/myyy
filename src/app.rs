@@ -98,10 +98,6 @@ impl App {
             Some(CoreEvent::AgentMessageDelta{
                 turn_id, delta
             })=>{
-            // println!(
-            //     "[App/Event] AgentMessageDelta(\
-            //     turn_id={turn_id}): {delta:?}"
-            // );
             match self.stream_state.push_delta(turn_id, delta) {
                 Ok(current_text) =>{
                     println!("[App/Streaming] turn_id={turn_id}, current={current_text:?}");
@@ -114,10 +110,6 @@ impl App {
             Some(CoreEvent::AgentMessage{
                 turn_id, text
             })=>{
-            //     println!(
-            //     "[App/Event] \
-            //     AgentMessage(turn_id={turn_id}): chars={}", text.chars().count()
-            // );
             match self.stream_state.finish(turn_id, text){
                 Ok(completion)=>{
                     println!(
@@ -144,6 +136,19 @@ impl App {
                 Some(CoreEvent::TurnAborted {
                     turn_id, reason
                 })=>{
+                    match self.stream_state.abort(turn_id){
+                        Ok(Some(discarded_text))=>{
+                            println!(
+                "[App/Streaming] \
+                 丢弃 turn_id={turn_id} 的部分消息：\
+                 {discarded_text:?}"
+            );
+                        }
+                        Ok(None) =>{}
+                        Err(error)=>{
+                            println!("[App/StreamingError] {error}");
+                        }
+                    }
                     println!(
                         "[App/Event] \
                         TurnAborted(\

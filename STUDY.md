@@ -222,3 +222,34 @@ Rust 概念：
 验收结果：`cargo fmt --check` 与 `cargo test` 通过，5 个测试全部成功；确定性测试验证取消后的完整事件序列只有 `TurnStarted` 和 `TurnAborted`。
 
 下一阶段：MVP 24，在 `TurnAborted` 到达时丢弃属于该 Turn 的部分流式状态，避免污染下一轮消息。
+
+## MVP 24：Discard Aborted Stream State
+
+目标：App 收到 `TurnAborted` 时，丢弃属于该 Turn 的未完成流式文本，让下一轮消息能够复用同一个 `StreamState`。
+
+数据流：
+
+```text
+AgentMessageDelta
+  -> StreamState 累积部分文本
+  -> TurnAborted
+  -> StreamState::abort
+  -> 清空 active_turn_id 与 accumulated_text
+  -> 下一 Turn 可以开始
+```
+
+被保护的不变量：被中止 Turn 的部分流式状态不能泄漏到下一 Turn；没有活动流的即时取消应当是无操作而不是错误。
+
+Rust 概念：
+
+- `Result<Option<String>, String>`：区分成功丢弃、没有活动流和 Turn ID 不匹配三种结果。
+- `std::mem::take`：取出被丢弃的部分文本，同时将缓存恢复为空字符串。
+- 守卫匹配：只允许与 `active_turn_id` 相同的终止事件清理当前流。
+
+生产源码对应：Codex TUI 的中断处理进入统一 `finalize_turn` 路径，清理临时流式尾部和流控制器。
+
+本阶段仍然省略：密集流式事件期间对用户输入与 `/cancel` 的明确调度优先级。
+
+验收结果：`cargo fmt --check` 与 `cargo test` 通过，7 个测试全部成功；测试验证部分流被丢弃后下一 Turn 能正常完成，以及没有活动流时终止为无操作。
+
+下一阶段：MVP 25，在 App 的 `tokio::select!` 中明确优先处理 TUI 输入，避免 `/cancel` 被连续 Core 流式事件推迟。
