@@ -48,13 +48,24 @@ pub fn start() -> AppServerSession {
                         "[App Server] 收到 UserTurn，\
                          转交给 Core"
                     );
+                    let cancellation_token = match session_control.reserve_turn().await {
+                        Ok(cancellation_token) => cancellation_token,
+                        Err(error) => {
+                            println!("[App Server] 无法启动 UserTurn：{error}");
+                            continue;
+                        }
+                    };
 
                     let session = Arc::clone(&session);
                     let event_tx = event_tx.clone();
 
                     //把所有权交给了start_turn
                     tokio::spawn(async move {
-                        session.lock().await.start_turn(items, event_tx).await;
+                        session
+                            .lock()
+                            .await
+                            .start_turn(items, event_tx, cancellation_token)
+                            .await;
                     });
                 }
                 AppCommand::Interrupt => {

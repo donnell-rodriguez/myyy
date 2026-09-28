@@ -158,3 +158,36 @@ Rust 概念：
 验收结果：`cargo fmt --check` 与 `cargo test` 通过；3 个测试全部成功。
 
 下一阶段：MVP 22，用确定性测试复现并修复“UserTurn 刚被接受时立即取消可能丢失”的竞态。
+
+## MVP 22：Reserve Active Turn Before Spawn
+
+目标：App Server 接受 `UserTurn` 后，先预留 `ActiveTurn`，再启动后台任务，避免紧随其后的 `Interrupt` 找不到取消目标。
+
+数据流：
+
+```text
+AppCommand::UserTurn
+  -> SessionControl::reserve_turn
+  -> ActiveTurn 持有 CancellationToken
+  -> tokio::spawn
+  -> Session::start_turn
+  -> AppCommand::Interrupt
+  -> SessionControl::interrupt
+  -> CancellationToken::cancel
+```
+
+被保护的不变量：一轮任务一旦被 App Server 接受，在后台任务真正开始前到达的取消信号也不能丢失。
+
+Rust 概念：
+
+- `Mutex<Option<ActiveTurn>>`：让“检查是否空闲”和“写入预留状态”成为一次受锁保护的状态转换。
+- `Result<CancellationToken, String>`：显式表达预留成功或已有活动 Turn。
+- `CancellationToken::clone`：预留状态与后台任务观察同一个共享取消状态。
+
+生产源码对应：Codex 在进行异步 Turn 准备前先在 `active_turn` 中插入一个尚未附加实际任务的 `ActiveTurn`，随后 Interrupt 就能观察到该生命周期状态。
+
+本阶段仍然省略：任务 panic 后的自动清理，以及取消后立刻停止模型循环并禁止继续输出最终消息。
+
+验收结果：`cargo fmt --check` 与 `cargo test` 通过，4 个测试全部成功；连续输入 `请执行 pwd` 和 `/cancel` 时，日志显示 `取消当前 ActiveTurn`、工具任务取消及 `TurnAborted`。
+
+下一阶段：MVP 23，让取消信号终止 `RegularTask` 循环，取消后不再继续请求模型或发送最终 Agent 消息。

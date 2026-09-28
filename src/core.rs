@@ -27,6 +27,18 @@ pub struct SessionControl {
 }
 
 impl SessionControl {
+    pub async fn reserve_turn(&self) -> Result<CancellationToken, String> {
+        let mut active_turn = self.active_turn.lock().await;
+        if active_turn.is_some() {
+            return Err("当前已经存在 ActiveTurn".to_string());
+        }
+        let cancellation_token = CancellationToken::new();
+        *active_turn = Some(ActiveTurn {
+            cancellation_token: cancellation_token.clone(),
+        });
+        Ok(cancellation_token)
+    }
+
     pub async fn interrupt(&self) {
         let active_turn = self.active_turn.lock().await;
         match active_turn.as_ref() {
@@ -240,6 +252,7 @@ impl Session {
         &mut self,
         input: Vec<UserInput>,
         event_tx: mpsc::UnboundedSender<CoreEvent>,
+        cancellation_token: CancellationToken,
     ) {
         self.next_turn_id += 1;
         // let should_auto_cancel = input.iter().any(|item| match item {
@@ -263,14 +276,6 @@ impl Session {
         //         cancellation_token.cancel();
         //     });
         // }
-        let cancellation_token = CancellationToken::new();
-        {
-            let mut active_turn = self.active_turn.lock().await;
-            *active_turn = Some(ActiveTurn {
-                cancellation_token: cancellation_token.clone(),
-            });
-        }
-
         let turn_context = TurnContext {
             turn_id: self.next_turn_id,
             tool_runtime: ToolCallRuntime::new(ToolRouter::new()),
@@ -312,5 +317,22 @@ impl Session {
         };
 
         let _ = event_tx.send(terminal_event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Session;
+
+    #[tokio::test]
+    async fn interrupt_after_reservation_is_not_lost() {
+        let session = Session::new();
+        let control = session.control();
+        let cancellation_token = control
+            .reserve_turn()
+            .await
+            .expect("应该成功预留第一轮任务");
+        control.interrupt().await;
+        assert!(cancellation_token.is_cancelled())
     }
 }
