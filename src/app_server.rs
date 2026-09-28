@@ -36,14 +36,6 @@ pub fn start() -> AppServerSession {
         while let Some(command) = command_rx.recv().await {
             match command {
                 AppCommand::UserTurn { items } => {
-                    // println!("[App Server] 收到 UserTurn，共 {} 个输入项", items.len());
-                    // for item in items {
-                    //     match item {
-                    //         UserInput::Text { text } => {
-                    //             println!("[App Server] Text：{text:?}");
-                    //         }
-                    //     }
-                    // }
                     println!(
                         "[App Server] 收到 UserTurn，\
                          转交给 Core"

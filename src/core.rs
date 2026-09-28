@@ -27,12 +27,16 @@ pub struct SessionControl {
 }
 
 impl SessionControl {
+    //在真正启动后台任务之前，先为这一轮 Turn 占一个位置，并提前准备好取消开关。
+    // reserve_turn() 负责的是“提前建立生命周期控制权”，不是执行 Agent。它让 Turn 在真正运行以前，就已经可以被发现、拒绝重复启动和取消。
     pub async fn reserve_turn(&self) -> Result<CancellationToken, String> {
+        // 我要尝试预留一个 Turn，成功就返回它的取消令牌，失败就返回错误。
         let mut active_turn = self.active_turn.lock().await;
         if active_turn.is_some() {
             return Err("当前已经存在 ActiveTurn".to_string());
         }
         let cancellation_token = CancellationToken::new();
+        // 为新 Turn 创建一个共享取消开关。
         *active_turn = Some(ActiveTurn {
             cancellation_token: cancellation_token.clone(),
         });
@@ -81,13 +85,6 @@ impl RegularTask {
             "[Core/RegularTask] session={} turn={} 开始",
             session.session_id, context.turn_id
         );
-        // for item in input {
-        //     match item {
-        //         UserInput::Text { text } => {
-        //             println!("[Core/RegularTask] 本轮输入：{text:?}");
-        //         }
-        //     }
-        // }
 
         let user_text = collect_text(input);
         println!("[Core/RegularTask] 本轮输入：{user_text:?}");
@@ -95,40 +92,6 @@ impl RegularTask {
             .history
             .push(ConversationItem::UserMessage { text: user_text });
 
-        // // println!("[Core/RegularTask] 模型调用尚未实现");
-        // let output = session.model.respond(&user_text).await;
-        // match output {
-        //     ModelOutput::AssistantMessage { text }=>{
-        //         println!(
-        //             "[ModelOutput::AssistantMessage] {text}"
-        //         );
-        //     }
-        //     ModelOutput::ToolCall { name, arguments }=>{
-        //         println!(
-        //             "[ModelOutput::ToolCall] \
-        //              name={name} arguments={arguments}"
-        //         );
-
-        //         // println!(
-        //         //     "[SAFETY PLACEHOLDER] \
-        //         //      本轮只展示工具调用，不执行命令"
-        //         // );
-        //         let call = ToolRouter::build_tool_call(name, arguments);
-        //         match context.tool_router.dispatch(call).await{
-        //             Ok(result)=>{
-        //                 println!(
-        //                     "[ToolResult] {}",
-        //                     result.output
-        //                 );
-        //             }
-        //             Err(error)=>{
-        //                 println!(
-        //                     "[ToolError] {error}"
-        //                 );
-        //             }
-        //         }
-        //     }
-        // }
         // 这里是不断的循环，根据循环的情况来确定我们的结果，是输出的是assistantmessage 还是我们的toolcall
         loop {
             println!(
@@ -137,8 +100,9 @@ impl RegularTask {
                 session.history.len()
             );
 
-            //调用模型
+            //调用模型，拿到结果
             let output = session.model.respond(session.history.items()).await;
+            //对于不同的结果做不同的事情
             match output {
                 ModelOutput::AssistantMessage { text } => {
                     // println!("[FinalAssistantMessage] {text}");
@@ -180,6 +144,7 @@ impl RegularTask {
                     // 由于我们当前是工具的取消，所以要放在这里, 使用regulartask子令牌
                     // 父令牌取消时，所有子令牌都会收到取消信号。
                     // 反过来，某个子令牌取消，不会取消整个父任务
+                    // context当中装有我们运行时所需要的工具内容
                         match context.tool_runtime.handle_tool_call(call, cancellation_token.child_token()).await {
                             Ok(result) => {
                                 println!("[ToolResult] {}", result.output);
@@ -255,27 +220,7 @@ impl Session {
         cancellation_token: CancellationToken,
     ) {
         self.next_turn_id += 1;
-        // let should_auto_cancel = input.iter().any(|item| match item {
-        //     UserInput::Text { text } => text.contains("等待"),
-        // });
-        // self.active_turn = Some(ActiveTurn {
-        //     cancellation_token: CancellationToken::new(),
-        // });
-        // let cancellation_token = self
-        //     .active_turn
-        //     .as_ref()
-        //     .expect("activeturn 刚刚创建，必然存在")
-        //     .cancellation_token
-        //     .clone();
 
-        // if should_auto_cancel {
-        //     let cancellation_token = cancellation_token.clone();
-        //     tokio::spawn(async move {
-        //         sleep(Duration::from_millis(500)).await;
-        //         println!("[Session/ActiveTurn] 发出取消信号");
-        //         cancellation_token.cancel();
-        //     });
-        // }
         let turn_context = TurnContext {
             turn_id: self.next_turn_id,
             tool_runtime: ToolCallRuntime::new(ToolRouter::new()),
@@ -284,23 +229,35 @@ impl Session {
             "[Core/Session {}] 创建 TurnContext(turn_id={})",
             self.session_id, turn_context.turn_id
         );
-        // 开始了，那么就要讲event_tx发送给app
+        // 开始了，那么就要通过event_tx将开始的信号发送给app
         let _ = event_tx.send(CoreEvent::TurnStarted {
             turn_id: turn_context.turn_id,
         });
-
+        // 取消部分
+        let task_cancellation_token = cancellation_token.child_token();
+        // 任务创建部分
+        let regular_task = RegularTask::new();
+        tokio::select! {
+        // 当多个分支同时已经准备好时，按照代码从上到下的顺序选择。
+        biased;
+        _ = cancellation_token.cancelled() =>{
+            println!(
+            "[Core/Session] \
+            Turn 在任务完成前收到取消信号"
+            );
+        }
         // 在此交给我们的reglartask
-        RegularTask::new()
-            .run(
-                self,
-                &turn_context,
-                input,
-                cancellation_token.child_token(),
-                &event_tx,
-            )
-            .await;
-        let was_cancelled = cancellation_token.is_cancelled();
+        _ = regular_task.run(
+                    self,
+                    &turn_context,
+                    input,
+                    task_cancellation_token,
+                    &event_tx,
+                )=>{}
+            }
 
+        let was_cancelled = cancellation_token.is_cancelled();
+        // 将对应的active_turn给清理掉
         *self.active_turn.lock().await = None;
 
         println!("[Core/Session] ActiveTurn 已清理");
@@ -322,6 +279,10 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc;
+
+    use crate::protocol::{CoreEvent, UserInput};
+
     use super::Session;
 
     #[tokio::test]
@@ -334,5 +295,38 @@ mod tests {
             .expect("应该成功预留第一轮任务");
         control.interrupt().await;
         assert!(cancellation_token.is_cancelled())
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_emits_no_agent_message() {
+        let mut session = Session::new();
+        let control = session.control();
+        let cancellation_token = control
+            .reserve_turn()
+            .await
+            .expect("应该成功预留第一轮任务");
+        control.interrupt().await;
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        session
+            .start_turn(
+                vec![UserInput::Text {
+                    text: "请执行 pwd".to_string(),
+                }],
+                event_tx,
+                cancellation_token,
+            )
+            .await;
+        let first_event = event_rx.recv().await.expect("应该收到 TurnStarted");
+        assert!(matches!(first_event, CoreEvent::TurnStarted { turn_id: 1 }));
+
+        let second_event = event_rx.recv().await.expect("应该收到 TurnAborted");
+        assert!(
+            matches!(second_event, CoreEvent::TurnAborted { turn_id:1, reason } if reason == "interrupted")
+        );
+
+        assert!(
+            event_rx.recv().await.is_none(),
+            "TurnAborted 后不应该再出现 AgentMessage 或其他事件"
+        )
     }
 }

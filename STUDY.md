@@ -191,3 +191,34 @@ Rust 概念：
 验收结果：`cargo fmt --check` 与 `cargo test` 通过，4 个测试全部成功；连续输入 `请执行 pwd` 和 `/cancel` 时，日志显示 `取消当前 ActiveTurn`、工具任务取消及 `TurnAborted`。
 
 下一阶段：MVP 23，让取消信号终止 `RegularTask` 循环，取消后不再继续请求模型或发送最终 Agent 消息。
+
+## MVP 23：Cancel the Whole Turn Task
+
+目标：让 Session 同时等待取消信号与 `RegularTask` 完成；取消发生时立即丢弃任务 Future，不再继续请求模型或发送最终 Agent 消息。
+
+数据流：
+
+```text
+Session::start_turn
+  -> tokio::select!
+     -> CancellationToken::cancelled
+     -> RegularTask::run
+  -> 清理 ActiveTurn
+  -> TurnAborted / TurnCompleted
+```
+
+被保护的不变量：被取消的 Turn 只能发送 `TurnStarted` 和一个 `TurnAborted` 终止结果，不能再发送 `AgentMessageDelta`、`AgentMessage` 或 `TurnCompleted`。
+
+Rust 概念：
+
+- `tokio::select!`：同时轮询取消 Future 与任务 Future，先完成的分支获胜。
+- `biased;`：多个分支同时就绪时按书写顺序选择，让已发生的取消优先于任务启动。
+- Future 丢弃：取消分支获胜后，未完成的 `RegularTask::run` Future 被丢弃，停止继续推进。
+
+生产源码对应：Codex 的 Session Task 接收取消令牌；中止流程取消该令牌，并阻止已取消任务继续走正常完成生命周期。
+
+本阶段仍然省略：Turn 已经发送部分流式增量后，App 侧主动清空未完成的 `StreamState`。
+
+验收结果：`cargo fmt --check` 与 `cargo test` 通过，5 个测试全部成功；确定性测试验证取消后的完整事件序列只有 `TurnStarted` 和 `TurnAborted`。
+
+下一阶段：MVP 24，在 `TurnAborted` 到达时丢弃属于该 Turn 的部分流式状态，避免污染下一轮消息。
