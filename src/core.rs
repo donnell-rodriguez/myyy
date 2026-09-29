@@ -1,5 +1,5 @@
 use crate::history::{ConversationHistory, ConversationItem, TurnAborted};
-use crate::model::{FakeModel, ModelOutput, ModelRequest};
+use crate::model::{FakeModel, ModelClient, ModelOutput, ModelRequest};
 use crate::protocol::UserInput;
 use crate::tools::{ToolCallRuntime, ToolRouter};
 // use tokio::time::{Duration, sleep};
@@ -106,6 +106,7 @@ impl RegularTask {
             println!("[Core/ModelRequest] tools={:#?}", request.tools);
 
             //调用模型，拿到结果
+            // 这里的session.model 是任何实现了 ModelClient 的对象
             let output = session.model.respond(request).await;
             //对于不同的结果做不同的事情
             match output {
@@ -196,17 +197,21 @@ fn collect_text(input: Vec<UserInput>) -> String {
 pub struct Session {
     session_id: u64,
     next_turn_id: u64,
-    model: FakeModel,
+    model: Arc<dyn ModelClient>,
     history: ConversationHistory,
     active_turn: Arc<Mutex<Option<ActiveTurn>>>,
 }
 
 impl Session {
     pub fn new() -> Self {
+        // 具体的model
+        Self::with_model(Arc::new(FakeModel::new()))
+    }
+    pub fn with_model(model: Arc<dyn ModelClient>) -> Self {
         Self {
             session_id: 1,
             next_turn_id: 0,
-            model: FakeModel::new(),
+            model,
             history: ConversationHistory::new(),
             active_turn: Arc::new(Mutex::new(None)),
         }
@@ -292,13 +297,76 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::ModelRequest;
+    use super::Session;
+    use crate::history::{ConversationItem, TurnAborted};
+    use crate::model::{ModelClient, ModelFuture, ModelOutput};
     use crate::protocol::{CoreEvent, UserInput};
     use crate::tools::ToolSpec;
     use serde_json::json;
+    use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    use super::Session;
-    use crate::history::{ConversationItem, TurnAborted};
+    struct FixedModel;
+
+    impl ModelClient for FixedModel {
+        fn respond<'a>(&'a self, _request: ModelRequest) -> ModelFuture<'a> {
+            Box::pin(async {
+                ModelOutput::AssistantMessage {
+                    text: "来自替代模型".to_string(),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn session_accepts_alternative_model_client() {
+        let model: Arc<dyn ModelClient> = Arc::new(FixedModel);
+
+        let mut session = Session::with_model(model);
+
+        let control = session.control();
+        let cancellation_token = control.reserve_turn().await.expect("应该成功预留 Turn");
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        session
+            .start_turn(
+                vec![UserInput::Text {
+                    text: "你好".to_string(),
+                }],
+                event_tx,
+                cancellation_token,
+            )
+            .await;
+
+        let mut final_text = None;
+
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                CoreEvent::AgentMessage { text, .. } => {
+                    final_text = Some(text);
+                }
+
+                CoreEvent::TurnCompleted { .. } => {
+                    break;
+                }
+
+                CoreEvent::TurnAborted { reason, .. } => {
+                    panic!("Turn 不应该终止：{reason}");
+                }
+
+                _ => {}
+            }
+        }
+
+        assert_eq!(final_text.as_deref(), Some("来自替代模型"));
+
+        assert!(matches!(
+            session.history.items().last(),
+            Some(ConversationItem::AssistantMessage { text })
+                if text == "来自替代模型"
+        ));
+    }
 
     #[test]
     fn model_request_contains_complete_history() {

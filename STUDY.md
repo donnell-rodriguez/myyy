@@ -374,3 +374,35 @@ Rust 概念：
 验收结果：`cargo fmt --check` 与 `cargo test` 通过，10 个测试全部成功；端到端 `pwd` 运行显示每次模型请求均携带 `exec_command` 规格，随后工具被正确路由和执行。测试还直接验证 `required` 与 `additionalProperties` 字段，避免无效 Schema 拼写漏过。
 
 下一阶段：MVP 29，引入 `ModelClient` trait，把 Core 从具体的 `FakeModel` 实现中解耦，为后续接入真实模型客户端建立边界。
+
+## MVP 29：Replaceable Model Client Boundary
+
+阶段类型：生产收敛（Convergence）。
+
+目标：让 `Session` 依赖 `ModelClient` 能力边界，而不是直接依赖 `FakeModel`，使模型实现可以被替换而不修改 Agent 主循环。
+
+数据流：
+
+```text
+Session
+  -> Arc<dyn ModelClient>
+  -> respond(ModelRequest)
+  -> ModelFuture
+  -> ModelOutput
+```
+
+被保护的不变量：无论注入 `FakeModel` 还是测试用 `FixedModel`，`RegularTask` 都只通过 `ModelClient` 请求模型，模型输出仍进入同一条消息或工具调用处理路径。
+
+Rust 概念：
+
+- `dyn ModelClient` 使用动态分发，让 `Session` 在运行时持有不同模型实现。
+- `Arc<dyn ModelClient>` 为模型客户端提供共享所有权以及 `Send + Sync` 并发边界。
+- `Pin<Box<dyn Future<...>>>` 把不同实现返回的异步计算统一成对象安全的 `ModelFuture`。
+
+生产源码对应：当前 Codex 使用具体的会话级 `ModelClient` 保存认证、Provider 和传输状态，再通过 `new_session()` 为每个 Turn 创建 `ModelClientSession`。本阶段的 trait 是教学重建，用最小代码先对齐“Core 依赖模型边界而不是假模型细节”的责任。
+
+本阶段仍然省略：真实 HTTP/WebSocket、认证、Provider、模型错误、流式响应，以及生产 Codex 的 Turn 级 `ModelClientSession` 生命周期。
+
+验收结果：`cargo fmt --check` 与 `cargo test` 通过，11 个测试全部成功；`session_accepts_alternative_model_client` 证明 `FixedModel` 可以替换 `FakeModel`。端到端 `请执行 pwd` 仍完成工具调用、结果入历史和第二次模型请求。
+
+下一阶段：MVP 30，引入每个 Turn 独立创建、同一 Turn 内重复使用的 `ModelSession`，对齐 Codex 的 `ModelClient::new_session()` 与 `ModelClientSession` 生命周期。
