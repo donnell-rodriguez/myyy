@@ -1,5 +1,6 @@
 use crate::history::ConversationItem;
 use crate::tools::ToolSpec;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 // 某一次模型调用看到的完整输入快照。
@@ -25,9 +26,30 @@ pub enum ModelOutput {
     AssistantMessage { text: String },
     ToolCall { name: String, arguments: String },
 }
+
+// 程序：保存模型失败原因。
+// Rust：实现 Display 后可以调用 .to_string()。
+// Agent：模型失败成为正式状态，而不是一条普通 Assistant 消息。
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelError {
+    RequestFailed(String),
+}
+impl fmt::Display for ModelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RequestFailed(message) => {
+                write!(f, "模型请求失败：{message}")
+            }
+        }
+    }
+}
+impl std::error::Error for ModelError {}
+
 // 不同模型实现产生的 Future 类型可能不同。
 // Box 把它们统一成一种可以放进 trait object 的类型。
-pub type ModelFuture<'a> = Pin<Box<dyn Future<Output = ModelOutput> + Send + 'a>>;
+pub type ModelFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ModelOutput, ModelError>> + Send + 'a>>;
 
 // 长期模型客户端。
 // 它负责为每个 Turn 创建独立的模型会话。
@@ -69,13 +91,18 @@ impl ModelSession for FakeModelSession {
             println!("[FakeModelSession] 本 Turn 第 {request_count} 次模型请求");
 
             let Some(last_item) = request.input.last() else {
-                return ModelOutput::AssistantMessage {
+                return Ok(ModelOutput::AssistantMessage {
                     text: "当前没有可处理的消息".to_string(),
-                };
+                });
             };
 
+            if matches!(last_item, ConversationItem::UserMessage { text } if text.contains("模型失败"))
+            {
+                return Err(ModelError::RequestFailed("模拟服务不可用".to_string()));
+            }
+
             // 判断最后一个item的情况，分别进行处理， 这里是模拟modeloutput的情况
-            match last_item {
+            let output = match last_item {
                 // wait工具
                 ConversationItem::UserMessage { text } if text.contains("等待") => {
                     ModelOutput::ToolCall {
@@ -114,7 +141,7 @@ impl ModelSession for FakeModelSession {
                     };
                     ModelOutput::AssistantMessage { text }
                 }
-                //工具调用 并没有完成
+                //工具调用没有完成
                 ConversationItem::ToolCall { name, arguments } => ModelOutput::AssistantMessage {
                     text: format!("工具{name}尚未返回结果， 参数是{arguments}"),
                 },
@@ -126,7 +153,8 @@ impl ModelSession for FakeModelSession {
                 ConversationItem::TurnAborted(marker) => ModelOutput::AssistantMessage {
                     text: format!("检测到历史中止记录：{}", marker.guidance),
                 },
-            }
+            };
+            Ok(output)
         })
     }
 }

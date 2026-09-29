@@ -56,6 +56,10 @@ pub enum CoreEvent {
     // 增量
     AgentMessageDelta { turn_id: u64, delta: String },
     AgentMessage { turn_id: u64, text: String },
+    //正常完成
     TurnCompleted { turn_id: u64 },
+    //用户主动取消
     TurnAborted { turn_id: u64, reason: String },
+    // 系统或模型失败
+    TurnFailed { turn_id: u64, error: String },
 }

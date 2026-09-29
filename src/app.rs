@@ -125,6 +125,30 @@ impl App {
                                 }
                                 println!("[App/Event] TurnAborted(turn_id={turn_id}, reason={reason})");
                             }
+                            Some(CoreEvent::TurnFailed {turn_id, error})=>{
+                                match self.stream_state.abort(turn_id){
+                                    Ok(Some(discarded_text))=>{
+                                        println!(
+                                            "[App/Streaming] \
+                                            丢弃 turn_id={turn_id} \
+                                            的部分消息：{discarded_text:?}"
+                                        );
+                                    }
+                                    Ok(None)=>{}
+                                    Err(stream_error)=>{
+                                        println!(
+                                            "[App/StreamingError] \
+                                            {stream_error}"
+                                        );
+                                    }
+                                }
+                                println!(
+                                    "[App/Event] \
+                                    TurnFailed(\
+                                    turn_id={turn_id}, \
+                                    error={error})"
+                                );
+                            }
                         None =>{
                             println!("[App] App Server 事件通道已关闭");
                             break;

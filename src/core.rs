@@ -1,5 +1,5 @@
 use crate::history::{ConversationHistory, ConversationItem, TurnAborted};
-use crate::model::{FakeModel, ModelClient, ModelOutput, ModelRequest, ModelSession};
+use crate::model::{FakeModel, ModelClient, ModelError, ModelOutput, ModelRequest, ModelSession};
 use crate::protocol::CoreEvent;
 use crate::protocol::UserInput;
 use crate::tools::{ToolCallRuntime, ToolRouter};
@@ -80,7 +80,7 @@ impl RegularTask {
         input: Vec<UserInput>,
         cancellation_token: CancellationToken,
         event_tx: &mpsc::UnboundedSender<CoreEvent>,
-    ) {
+    ) -> Result<(), ModelError> {
         println!(
             "[Core/RegularTask] session={} turn={} 开始",
             session.session_id, context.turn_id
@@ -107,7 +107,7 @@ impl RegularTask {
 
             // 调用当前 Turn 的模型会话，拿到结果。
             // 循环本身不创建 ModelSession，所以工具执行完成后的第二次模型请求仍然使用同一个对象。
-            let output = model_session.respond(request).await;
+            let output = model_session.respond(request).await?;
             //对于不同的结果做不同的事情
             match output {
                 ModelOutput::AssistantMessage { text } => {
@@ -181,6 +181,7 @@ impl RegularTask {
             context.turn_id,
             session.history.len()
         );
+        Ok(())
     }
 }
 
@@ -250,7 +251,7 @@ impl Session {
         let task_cancellation_token = cancellation_token.child_token();
         // 任务创建部分
         let regular_task = RegularTask::new();
-        tokio::select! {
+        let task_result = tokio::select! {
         // 当多个分支同时已经准备好时，按照代码从上到下的顺序选择。
         biased;
         _ = cancellation_token.cancelled() =>{
@@ -258,9 +259,10 @@ impl Session {
             "[Core/Session] \
             Turn 在任务完成前收到取消信号"
             );
+            None
         }
         // 在此交给我们的reglartask
-        _ = regular_task.run(
+        result = regular_task.run(
                     self,
                     &turn_context,
                     //对盒子内部真实模型会话的可变借用。
@@ -268,8 +270,11 @@ impl Session {
                     input,
                     task_cancellation_token,
                     &event_tx,
-                )=>{}
-            }
+                )=>{
+                    Some(result)
+                }
+        };
+        let model_err = task_result.and_then(Result::err);
         // 取消
         let was_cancelled = cancellation_token.is_cancelled();
         // 将取消的信息写入历史
@@ -284,10 +289,18 @@ impl Session {
 
         println!("[Core/Session] ActiveTurn 已清理");
         // 如果出现了取消的情况，那么也要把这个信号发出去。发到app上
+        // 先判断取消
+        // 再判断模型错误
+        // 最后才是正常完成
         let terminal_event = if was_cancelled {
             CoreEvent::TurnAborted {
                 turn_id: turn_context.turn_id,
                 reason: "interrupted".to_string(),
+            }
+        } else if let Some(error) = model_err {
+            CoreEvent::TurnFailed {
+                turn_id: turn_context.turn_id,
+                error: error.to_string(),
             }
         } else {
             CoreEvent::TurnCompleted {
@@ -324,9 +337,9 @@ mod tests {
     impl ModelSession for FixedModelSession {
         fn respond<'a>(&'a mut self, _request: ModelRequest) -> ModelFuture<'a> {
             Box::pin(async {
-                ModelOutput::AssistantMessage {
+                Ok(ModelOutput::AssistantMessage {
                     text: "来自替代模型".to_string(),
-                }
+                })
             })
         }
     }
@@ -462,5 +475,50 @@ mod tests {
             event_rx.recv().await.is_none(),
             "TurnAborted 后不应该再出现 AgentMessage 或其他事件"
         )
+    }
+
+    #[tokio::test]
+    async fn model_error_emits_turn_failed_not_completed() {
+        let mut session = Session::new();
+        let control = session.control();
+
+        let cancellation_token = control.reserve_turn().await.expect("应该成功预留 Turn");
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        session
+            .start_turn(
+                vec![UserInput::Text {
+                    text: "请模拟模型失败".to_string(),
+                }],
+                event_tx,
+                cancellation_token,
+            )
+            .await;
+
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(CoreEvent::TurnStarted { turn_id: 1 })
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(CoreEvent::TurnFailed {
+                turn_id: 1,
+                error,
+            }) if error
+                == "模型请求失败：模拟服务不可用"
+        ));
+
+        assert!(
+            event_rx.recv().await.is_none(),
+            "TurnFailed 后不能再出现 \
+         TurnCompleted 或 AgentMessage"
+        );
+
+        control
+            .reserve_turn()
+            .await
+            .expect("失败后 ActiveTurn 应该已经清理");
     }
 }

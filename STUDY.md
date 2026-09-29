@@ -439,3 +439,37 @@ Rust 概念：
 验收结果：`cargo fmt --check` 与 `cargo test` 通过，11 个测试全部成功；端到端 `请执行 pwd` 只打印一次“创建新的 ModelSession”，随后同一会话打印第 1、2 次模型请求，工具链和最终消息保持正常。
 
 下一阶段：MVP 31，让模型调用返回 `Result<ModelOutput, ModelError>`，使网络、认证或模型响应失败成为显式的 Turn 终止路径。
+
+## MVP 31：Explicit Model Failure Lifecycle
+
+阶段类型：正确性（Correctness）与生产收敛（Convergence）。
+
+目标：模型请求显式返回 `Result<ModelOutput, ModelError>`；失败的 Turn 必须清理活动状态并发送 `TurnFailed`，不能误报为正常完成。
+
+数据流：
+
+```text
+ModelSession::respond
+  -> Err(ModelError)
+  -> RegularTask::run 返回 Err
+  -> Session 清理 ActiveTurn
+  -> CoreEvent::TurnFailed
+  -> App 丢弃未完成流并展示错误
+```
+
+被保护的不变量：每个 Turn 只能产生一种终止结果——`TurnCompleted`、`TurnAborted` 或 `TurnFailed`；模型失败后不能再产生 Agent 消息或完成事件，并且下一 Turn 可以被预留。
+
+Rust 概念：
+
+- `Result<ModelOutput, ModelError>` 把成功输出和失败原因编码进类型。
+- `?` 在模型失败时提前退出 `RegularTask::run`，同时保留类型化错误。
+- `Option<Result<(), ModelError>>` 区分取消分支、任务成功和任务失败。
+- 实现 `Display` 与 `Error` 让 `ModelError` 能在内部保持类型，在协议边界转换为可展示文本。
+
+生产源码对应：Codex 的 `ModelClientSession::stream` 返回 `Result<ResponseStream>`；请求建立失败、流中错误或流提前关闭都会沿 `CodexErr` 传播，并通过错误生命周期事件通知客户端。
+
+本阶段仍然省略：错误分类、HTTP 状态、认证刷新、重试/退避、限流、上下文窗口错误、错误历史标记以及真实流式传输。
+
+验收结果：`cargo fmt --check` 与 `cargo test` 通过，12 个测试全部成功；`model_error_emits_turn_failed_not_completed` 验证错误终止的互斥性及 ActiveTurn 清理。端到端输入“请模拟模型失败”只产生 `TurnStarted` 和 `TurnFailed`。
+
+下一阶段：MVP 32，让 `ModelSession` 返回模型事件流，把文本增量的来源从 Core 字符拆分迁移到模型边界。
