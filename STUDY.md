@@ -253,3 +253,32 @@ Rust 概念：
 验收结果：`cargo fmt --check` 与 `cargo test` 通过，7 个测试全部成功；测试验证部分流被丢弃后下一 Turn 能正常完成，以及没有活动流时终止为无操作。
 
 下一阶段：MVP 25，在 App 的 `tokio::select!` 中明确优先处理 TUI 输入，避免 `/cancel` 被连续 Core 流式事件推迟。
+
+## MVP 25：Prioritize TUI Input
+
+目标：在 App 的主事件循环中明确优先处理终端输入，让流式 Core 事件持续到达时，`/cancel` 仍能及时进入控制路径。
+
+数据流：
+
+```text
+TUI Submitted("/cancel")
+  -> App 的 biased tokio::select!
+  -> AppCommand::Interrupt
+  -> SessionControl::interrupt
+  -> CancellationToken::cancel
+```
+
+被保护的不变量：当 TUI 输入和 Core 事件同时就绪时，App 必须先处理 TUI 输入。
+
+Rust 概念：
+
+- `tokio::select!` 的 `biased;` 模式按照分支书写顺序选择同时就绪的 Future。
+- 分支优先级只影响 App 的事件调度，不改变 Core 的取消语义。
+
+生产源码对应：Codex TUI 在统一事件循环中协调终端输入、应用事件和 App Server 事件；生产实现还使用队列状态和条件守卫控制事件处理顺序。
+
+本阶段仍然省略：生产 TUI 的按键级输入、绘制事件、启动保护队列、重连以及更精细的公平调度。
+
+验收结果：`cargo fmt --check` 与 `cargo test` 通过，8 个测试全部成功；定时输入验证确认流式输出尚未完成时 `/cancel` 会立即进入 Interrupt 路径并产生 `TurnAborted`。
+
+下一阶段：MVP 26，在取消 Turn 时先把模型可见的中止标记写入 ConversationHistory，再发送 `TurnAborted`。
