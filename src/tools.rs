@@ -1,6 +1,7 @@
 use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
 
 use serde::Deserialize;
+use serde_json::{Value, json};
 use tokio::process::Command;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -15,29 +16,13 @@ pub struct ToolResult {
     pub output: String,
 }
 
-// 这里只是有一个工具叫做exec_command
-// 如果多了之后怎么办，这就没有办法进行使用了。所以这里我们需要另外一套逻辑。
-// pub struct ToolRouter {
-//     exec_command: ExecCommandHandler,
-// }
-// impl ToolRouter {
-//     pub fn new() -> Self {
-//         Self {
-//             exec_command: ExecCommandHandler::new(),
-//         }
-//     }
-
-//     pub fn build_tool_call(name: String, arguments: String) -> ToolCall {
-//         ToolCall { name, arguments }
-//     }
-//     // 查看模型想调用哪个工具， 当前是写死的状态，我们进行灵活的写
-//     pub async fn dispatch(&self, call: ToolCall) -> Result<ToolResult, String> {
-//         match call.name.as_str() {
-//             "exec_command" => self.exec_command.handle(call).await,
-//             unsupported => Err(format!("不支持的工具:{unsupported}")),
-//         }
-//     }
-// }
+// 提供给模型看的工具说明。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
 
 // ToolRouter：接收并转交工具调用
 pub struct ToolRouter {
@@ -59,6 +44,9 @@ impl ToolRouter {
     pub async fn dispatch(&self, call: ToolCall) -> Result<ToolResult, String> {
         self.registry.dispatch(call).await
     }
+    pub fn model_visible_specs(&self) -> Vec<ToolSpec> {
+        self.registry.model_visible_specs()
+    }
 }
 
 // 不同工具产生的 Future 类型不同，
@@ -68,7 +56,9 @@ type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolResult, String>> + 
 // ToolExecutor：执行具体工具行为
 trait ToolExecutor: Send + Sync {
     fn tool_name(&self) -> &'static str;
-    // 执行一次工具调用。
+    // 返回给模型看的工具说明。
+    fn spec(&self) -> ToolSpec;
+    // 执行模型产生的工具调用。
     fn handle<'a>(&'a self, call: ToolCall) -> ToolFuture<'a>;
 }
 
@@ -107,6 +97,22 @@ impl ToolRegistry {
         println!("[ToolRegistry] 路由到工具：{tool_name}");
         tool.handle(call).await
     }
+
+    fn model_visible_specs(&self) -> Vec<ToolSpec> {
+        let mut specs = self
+            .tools
+            .values()
+            .map(|tool| tool.spec())
+            .collect::<Vec<_>>();
+        // HashMap 本身不保证迭代顺序。如果以后有多个工具，不排序可能导致每次请求的工具顺序不同。
+        // 稳定顺序有利于：
+        // - 测试稳定
+        // - Prompt 稳定
+        // - 请求缓存
+        // - 调试比较
+        specs.sort_by(|left, right| left.name.cmp(&right.name));
+        specs
+    }
 }
 
 // ToolCallRuntime：管理一次工具任务的生命周期
@@ -120,6 +126,9 @@ impl ToolCallRuntime {
             router: Arc::new(router),
         }
     }
+    pub fn model_visible_specs(&self) -> Vec<ToolSpec> {
+        self.router.model_visible_specs()
+    }
 
     pub async fn handle_tool_call(
         &self,
@@ -127,20 +136,7 @@ impl ToolCallRuntime {
         cancellation_token: CancellationToken,
     ) -> Result<ToolResult, String> {
         let router = Arc::clone(&self.router);
-        // // 异步一
-        // let should_auto_cancel = call.arguments.contains(r#""cmd":"wait""#);
-        // // 可以被很多异步任务共同观察的取消信号灯
-        // let cancellation_token = CancellationToken::new();
-        // if should_auto_cancel {
-        //     let cancellation_token = cancellation_token.clone();
-        //     tokio::spawn(async move {
-        //         sleep(Duration::from_millis(500)).await;
-        //         println!("[Cancellation] 发出取消信号");
-        //         // 不会自动终止代码，只会通知代码“应该取消了
-        //         cancellation_token.cancel();
-        //     });
-        // }
-        // 异步二
+
         println!("[ToolCallRuntime] 创建独立工具任务");
         let mut task_handle = tokio::spawn(async move {
             println!("[ToolCallRuntime] 工具任务开始");
@@ -242,22 +238,50 @@ impl ToolExecutor for ExecCommandHandler {
     fn tool_name(&self) -> &'static str {
         "exec_command"
     }
+
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.tool_name().to_string(),
+            description: "执行一个经过审批的终端命令".to_string(),
+            // JSON 只是描述参数，并没有执行命令。
+            parameters: json!(
+                {
+                    "type":"object",
+                    "properties":{
+                        "cmd":{
+                            "type":"string",
+                            "description":"需要执行的终端命令",
+                        }
+                    },
+                    "required":["cmd"],
+                    "additionalProperties":false
+                }
+            ),
+        }
+    }
     // 这里来到了具体执行的工具这个阶段了
     fn handle<'a>(&'a self, call: ToolCall) -> ToolFuture<'a> {
         Box::pin(async move { self.execute(call).await })
     }
 }
-// struct FakeExecCommandHandler;
 
-// impl FakeExecCommandHandler {
-//     async fn handle(&self, call:ToolCall) ->ToolResult {
-//         println!(
-//             "[FakeExecCommandHandler] 收到参数：{}",
-//             call.arguments
-//         );
-//         ToolResult {
-//             output: concat!("模拟结果：/fake/project",
-//                 "（没有执行真实 pwd）").to_string(),
-//         }
-//     }
-// }
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{ExecCommandHandler, ToolExecutor, ToolRouter};
+
+    #[test]
+    fn registered_tools_are_model_visible() {
+        let router = ToolRouter::new();
+
+        let expected = vec![ExecCommandHandler::new().spec()];
+
+        assert_eq!(router.model_visible_specs(), expected);
+
+        let specs = router.model_visible_specs();
+        assert_eq!(specs[0].name, "exec_command");
+        assert_eq!(specs[0].parameters["required"], json!(["cmd"]));
+        assert_eq!(specs[0].parameters["additionalProperties"], json!(false));
+    }
+}

@@ -343,3 +343,34 @@ Rust 概念：
 验收结果：`cargo fmt --check` 与 `cargo test` 通过，9 个测试全部成功；两轮运行验证第二轮模型请求包含第一轮对话，工具完成后的后续请求包含 `UserMessage`、`AssistantMessage`、`ToolCall` 和 `ToolResult` 的完整历史。
 
 下一阶段：MVP 28，把模型可见的工具规格加入 `ModelRequest`，让模型同时看到对话上下文与允许调用的工具能力。
+
+## MVP 28：Model-visible Tool Specifications
+
+目标：让每次 `ModelRequest` 同时携带完整历史和当前已注册工具的模型可见规格，使“能够执行的工具”和“告诉模型的工具”来自同一个实现。
+
+数据流：
+
+```text
+ExecCommandHandler::spec
+  -> ToolRegistry::model_visible_specs
+  -> ToolRouter
+  -> ToolCallRuntime
+  -> ModelRequest.tools
+  -> FakeModel
+```
+
+被保护的不变量：每个允许执行的工具都必须以名称、说明和 JSON 参数 Schema 出现在模型请求中；规格与执行器绑定在同一个 `ToolExecutor` 实现上。
+
+Rust 概念：
+
+- trait 方法 `spec()` 让不同工具各自声明模型可见的能力说明。
+- `serde_json::Value` 与 `json!` 宏用结构化数据表示工具参数 Schema。
+- 对 `HashMap` 收集出的规格按名称排序，保证测试、日志和请求内容顺序稳定。
+
+生产源码对应：Codex 的 `ToolExecutor::spec` 定义工具规格，`ToolRouter::model_visible_specs` 收集当前工具，Turn 在构造 `Prompt` 时把这些规格写入 `Prompt.tools`。
+
+本阶段仍然省略：真实模型根据 Schema 自主选择工具、动态 MCP 工具、并行工具调用、工具暴露策略和完整 JSON Schema 校验。
+
+验收结果：`cargo fmt --check` 与 `cargo test` 通过，10 个测试全部成功；端到端 `pwd` 运行显示每次模型请求均携带 `exec_command` 规格，随后工具被正确路由和执行。测试还直接验证 `required` 与 `additionalProperties` 字段，避免无效 Schema 拼写漏过。
+
+下一阶段：MVP 29，引入 `ModelClient` trait，把 Core 从具体的 `FakeModel` 实现中解耦，为后续接入真实模型客户端建立边界。

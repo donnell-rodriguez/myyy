@@ -1,16 +1,19 @@
 use crate::history::ConversationItem;
+use crate::tools::ToolSpec;
 // 某一次模型调用看到的完整输入快照。
 // 每次请求模型前，把当前完整 ConversationHistory 复制成一个独立的 ModelRequest，而不是让模型直接借用 Session 内部历史。
+// 让 ModelRequest 除了携带对话历史，还携带当前模型可以调用的工具定义。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRequest {
     pub input: Vec<ConversationItem>,
+    pub tools: Vec<ToolSpec>,
 }
-//类型转换
-impl From<&[ConversationItem]> for ModelRequest {
-    fn from(history: &[ConversationItem]) -> Self {
-        // 克隆所有 ConversationItem，形成独立的 Vec。
+
+impl ModelRequest {
+    pub fn new(history: &[ConversationItem], tools: Vec<ToolSpec>) -> Self {
         Self {
             input: history.to_vec(),
+            tools,
         }
     }
 }

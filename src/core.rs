@@ -99,9 +99,11 @@ impl RegularTask {
                  请求模型，history_items={}",
                 session.history.len()
             );
-            let request = ModelRequest::from(session.history.items());
+            let tools = context.tool_runtime.model_visible_specs();
+            let request = ModelRequest::new(session.history.items(), tools);
             println!("[Core/ModelRequest] input_items={}", request.input.len());
             println!("[Core/ModelRequest] input={:#?}", request.input);
+            println!("[Core/ModelRequest] tools={:#?}", request.tools);
 
             //调用模型，拿到结果
             let output = session.model.respond(request).await;
@@ -291,10 +293,13 @@ impl Session {
 mod tests {
     use super::ModelRequest;
     use crate::protocol::{CoreEvent, UserInput};
+    use crate::tools::ToolSpec;
+    use serde_json::json;
     use tokio::sync::mpsc;
 
     use super::Session;
     use crate::history::{ConversationItem, TurnAborted};
+
     #[test]
     fn model_request_contains_complete_history() {
         let history = vec![
@@ -306,8 +311,25 @@ mod tests {
                 text: "请继续".to_string(),
             },
         ];
-        let actual = ModelRequest::from(history.as_slice());
-        let expected = ModelRequest { input: history };
+        let tools = vec![ToolSpec {
+            name: "exec_command".to_string(),
+            description: "执行终端命令".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "cmd": {
+                        "type": "string"
+                    }
+                },
+                "required": ["cmd"],
+                "additionalProperties": false
+            }),
+        }];
+        let actual = ModelRequest::new(history.as_slice(), tools.clone());
+        let expected = ModelRequest {
+            input: history,
+            tools,
+        };
         assert_eq!(actual, expected);
     }
 
