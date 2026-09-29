@@ -1,4 +1,19 @@
 use crate::history::ConversationItem;
+// 某一次模型调用看到的完整输入快照。
+// 每次请求模型前，把当前完整 ConversationHistory 复制成一个独立的 ModelRequest，而不是让模型直接借用 Session 内部历史。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRequest {
+    pub input: Vec<ConversationItem>,
+}
+//类型转换
+impl From<&[ConversationItem]> for ModelRequest {
+    fn from(history: &[ConversationItem]) -> Self {
+        // 克隆所有 ConversationItem，形成独立的 Vec。
+        Self {
+            input: history.to_vec(),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum ModelOutput {
@@ -12,18 +27,10 @@ impl FakeModel {
     pub fn new() -> Self {
         Self
     }
-    // pub async fn respond(&self, input:&str)->ModelOutput {
-    //     if input.contains("pwd"){
-    //         ModelOutput::ToolCall { name: "exec_command".to_string(), arguments: r#"{"cmd":"pwd"}"#.to_string() }
-    //     } else if input.contains("ls") {
-    //         ModelOutput::ToolCall { name: "exec_command".to_string(), arguments: r#"{"cmd":"ls"}"#.to_string() }
-    //     }else {
-    //         ModelOutput::AssistantMessage { text: format!("我收到了你的消息：{input}") }
-    //     }
-    // }
-    pub async fn respond(&self, history: &[ConversationItem]) -> ModelOutput {
+
+    pub async fn respond(&self, request: ModelRequest) -> ModelOutput {
         // 取出最后一个item
-        let Some(last_item) = history.last() else {
+        let Some(last_item) = request.input.last() else {
             return ModelOutput::AssistantMessage {
                 text: "当前没有可处理的消息".to_string(),
             };
@@ -76,6 +83,7 @@ impl FakeModel {
             ConversationItem::AssistantMessage { text } => {
                 ModelOutput::AssistantMessage { text: text.clone() }
             }
+            // 中止
             ConversationItem::TurnAborted(marker) => ModelOutput::AssistantMessage {
                 text: format!("检测到历史中止记录：{}", marker.guidance),
             },

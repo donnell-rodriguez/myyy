@@ -1,5 +1,5 @@
 use crate::history::{ConversationHistory, ConversationItem, TurnAborted};
-use crate::model::{FakeModel, ModelOutput};
+use crate::model::{FakeModel, ModelOutput, ModelRequest};
 use crate::protocol::UserInput;
 use crate::tools::{ToolCallRuntime, ToolRouter};
 // use tokio::time::{Duration, sleep};
@@ -99,9 +99,12 @@ impl RegularTask {
                  请求模型，history_items={}",
                 session.history.len()
             );
+            let request = ModelRequest::from(session.history.items());
+            println!("[Core/ModelRequest] input_items={}", request.input.len());
+            println!("[Core/ModelRequest] input={:#?}", request.input);
 
             //调用模型，拿到结果
-            let output = session.model.respond(session.history.items()).await;
+            let output = session.model.respond(request).await;
             //对于不同的结果做不同的事情
             match output {
                 ModelOutput::AssistantMessage { text } => {
@@ -286,12 +289,27 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use tokio::sync::mpsc;
-
+    use super::ModelRequest;
     use crate::protocol::{CoreEvent, UserInput};
+    use tokio::sync::mpsc;
 
     use super::Session;
     use crate::history::{ConversationItem, TurnAborted};
+    #[test]
+    fn model_request_contains_complete_history() {
+        let history = vec![
+            ConversationItem::UserMessage {
+                text: "请执行 pwd".to_string(),
+            },
+            ConversationItem::TurnAborted(TurnAborted::interrupted()),
+            ConversationItem::UserMessage {
+                text: "请继续".to_string(),
+            },
+        ];
+        let actual = ModelRequest::from(history.as_slice());
+        let expected = ModelRequest { input: history };
+        assert_eq!(actual, expected);
+    }
 
     #[tokio::test]
     async fn interrupt_after_reservation_is_not_lost() {

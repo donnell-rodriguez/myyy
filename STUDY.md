@@ -313,3 +313,33 @@ Rust 概念：
 验收结果：`cargo fmt --check` 与 `cargo test` 通过，8 个测试全部成功；取消测试验证历史精确包含 `ConversationItem::TurnAborted`，并且终止事件后没有额外 Agent 消息。
 
 下一阶段：MVP 27，让 FakeModel 读取完整 ConversationHistory，并显式构造一次模型请求快照，而不是只读取最后一个历史项。
+
+## MVP 27：Complete Model Request Snapshot
+
+目标：每次调用模型前，把 Session 持有的完整 `ConversationHistory` 克隆为独立的 `ModelRequest`，明确区分长期会话状态和单次模型请求快照。
+
+数据流：
+
+```text
+ConversationHistory
+  -> ModelRequest::from(&[ConversationItem])
+  -> 独立 Vec<ConversationItem> 快照
+  -> FakeModel::respond(ModelRequest)
+  -> ModelOutput
+```
+
+被保护的不变量：一次模型请求必须包含构造时的完整历史，不能只复制最后一项，也不能遗漏工具结果或中止标记。
+
+Rust 概念：
+
+- `From<&[ConversationItem]>` 定义从借用历史切片到请求类型的显式转换。
+- `slice::to_vec()` 克隆历史项目，让请求拥有独立快照。
+- `ModelRequest` 按值传入模型，避免模型直接借用 Session 内部可变状态。
+
+生产源码对应：Codex 在采样前克隆 ContextManager 历史，通过 `for_prompt` 规范化为 `Vec<ResponseItem>`，再放入 `Prompt.input`。
+
+本阶段仍然省略：系统指令、模型参数、工具规格、输入模态过滤、历史截断和真实网络请求；FakeModel 暂时仍根据快照最后一项决定输出。
+
+验收结果：`cargo fmt --check` 与 `cargo test` 通过，9 个测试全部成功；两轮运行验证第二轮模型请求包含第一轮对话，工具完成后的后续请求包含 `UserMessage`、`AssistantMessage`、`ToolCall` 和 `ToolResult` 的完整历史。
+
+下一阶段：MVP 28，把模型可见的工具规格加入 `ModelRequest`，让模型同时看到对话上下文与允许调用的工具能力。
