@@ -1,4 +1,4 @@
-use crate::history::{ConversationHistory, ConversationItem};
+use crate::history::{ConversationHistory, ConversationItem, TurnAborted};
 use crate::model::{FakeModel, ModelOutput};
 use crate::protocol::UserInput;
 use crate::tools::{ToolCallRuntime, ToolRouter};
@@ -255,8 +255,15 @@ impl Session {
                     &event_tx,
                 )=>{}
             }
-
+        // 取消
         let was_cancelled = cancellation_token.is_cancelled();
+        // 将取消的信息写入历史
+        if was_cancelled {
+            self.history
+                .push(ConversationItem::TurnAborted(TurnAborted::interrupted()));
+            println!("[Core/Session] 已将 TurnAborted 标记写入历史");
+            println!("[Core/History] {:#?}", self.history.items());
+        }
         // 将对应的active_turn给清理掉
         *self.active_turn.lock().await = None;
 
@@ -284,6 +291,7 @@ mod tests {
     use crate::protocol::{CoreEvent, UserInput};
 
     use super::Session;
+    use crate::history::{ConversationItem, TurnAborted};
 
     #[tokio::test]
     async fn interrupt_after_reservation_is_not_lost() {
@@ -322,6 +330,11 @@ mod tests {
         let second_event = event_rx.recv().await.expect("应该收到 TurnAborted");
         assert!(
             matches!(second_event, CoreEvent::TurnAborted { turn_id:1, reason } if reason == "interrupted")
+        );
+        println!("[Test/History] {:#?}", session.history.items());
+        assert_eq!(
+            session.history.items(),
+            &[ConversationItem::TurnAborted(TurnAborted::interrupted())]
         );
 
         assert!(

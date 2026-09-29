@@ -282,3 +282,34 @@ Rust 概念：
 验收结果：`cargo fmt --check` 与 `cargo test` 通过，8 个测试全部成功；定时输入验证确认流式输出尚未完成时 `/cancel` 会立即进入 Interrupt 路径并产生 `TurnAborted`。
 
 下一阶段：MVP 26，在取消 Turn 时先把模型可见的中止标记写入 ConversationHistory，再发送 `TurnAborted`。
+
+## MVP 26：Interrupted Turn History Marker
+
+目标：Turn 被用户取消时，先把模型可见的中止说明写入长期历史，再向 App 发送 `TurnAborted`。
+
+数据流：
+
+```text
+CancellationToken 被取消
+  -> 丢弃 RegularTask Future
+  -> ConversationItem::TurnAborted
+  -> ConversationHistory
+  -> 清理 ActiveTurn
+  -> CoreEvent::TurnAborted
+```
+
+被保护的不变量：外部观察者收到 `TurnAborted` 时，Core 的历史中已经存在对应的中止标记；取消后不能继续产生 Agent 消息或正常完成事件。
+
+Rust 概念：
+
+- tuple enum variant `ConversationItem::TurnAborted(TurnAborted)` 为历史项携带类型化数据。
+- `Clone + PartialEq + Eq` 让完整历史项可以被复制并执行结构化相等比较。
+- `assert_eq!` 直接验证整个历史切片，而不是只观察日志。
+
+生产源码对应：Codex 在中断任务后记录模型可见的 `<turn_aborted>` 上下文片段，并确保该标记可见后再发送 `TurnAborted` 生命周期事件。
+
+本阶段仍然省略：历史持久化、上下文片段角色选择、XML 标记渲染，以及把完整 ConversationHistory 转换为模型请求。
+
+验收结果：`cargo fmt --check` 与 `cargo test` 通过，8 个测试全部成功；取消测试验证历史精确包含 `ConversationItem::TurnAborted`，并且终止事件后没有额外 Agent 消息。
+
+下一阶段：MVP 27，让 FakeModel 读取完整 ConversationHistory，并显式构造一次模型请求快照，而不是只读取最后一个历史项。

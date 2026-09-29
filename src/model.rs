@@ -76,6 +76,9 @@ impl FakeModel {
             ConversationItem::AssistantMessage { text } => {
                 ModelOutput::AssistantMessage { text: text.clone() }
             }
+            ConversationItem::TurnAborted(marker) => ModelOutput::AssistantMessage {
+                text: format!("检测到历史中止记录：{}", marker.guidance),
+            },
         }
     }
 }
