@@ -406,3 +406,36 @@ Rust 概念：
 验收结果：`cargo fmt --check` 与 `cargo test` 通过，11 个测试全部成功；`session_accepts_alternative_model_client` 证明 `FixedModel` 可以替换 `FakeModel`。端到端 `请执行 pwd` 仍完成工具调用、结果入历史和第二次模型请求。
 
 下一阶段：MVP 30，引入每个 Turn 独立创建、同一 Turn 内重复使用的 `ModelSession`，对齐 Codex 的 `ModelClient::new_session()` 与 `ModelClientSession` 生命周期。
+
+## MVP 30：Turn-scoped Model Session
+
+阶段类型：生产收敛（Convergence）。
+
+目标：长期 `Session` 保存 `ModelClient`，每个 Turn 创建一个新的 `ModelSession`；同一 Turn 中工具调用前后的多次模型请求复用这个会话。
+
+数据流：
+
+```text
+Session.model: Arc<dyn ModelClient>
+  -> ModelClient::new_session（每个 Turn 一次）
+  -> Box<dyn ModelSession>
+  -> respond #1：产生 ToolCall
+  -> 工具结果写入历史
+  -> respond #2：产生最终消息
+```
+
+被保护的不变量：一个 Turn 只创建一个模型会话，并在 Agent 循环内重复使用；下一个 Turn 才创建新的模型会话。
+
+Rust 概念：
+
+- `Box<dyn ModelSession>` 持有一个运行时确定类型的 Turn 级模型会话。
+- `model_session.as_mut()` 得到 `&mut dyn ModelSession`，把同一个会话可变借给 Agent 循环。
+- `respond(&mut self, ...)` 允许会话保存请求计数以及未来的连接、路由等 Turn 内状态。
+
+生产源码对应：Codex 的会话级 `ModelClient` 通过 `new_session()` 为每个 Turn 创建 `ModelClientSession`；`run_turn` 在循环与工具后续请求中持续传递同一个可变 `client_session`。
+
+本阶段仍然省略：WebSocket 连接、sticky routing token、增量请求复用、预热客户端会话、传输回退以及真实模型错误。
+
+验收结果：`cargo fmt --check` 与 `cargo test` 通过，11 个测试全部成功；端到端 `请执行 pwd` 只打印一次“创建新的 ModelSession”，随后同一会话打印第 1、2 次模型请求，工具链和最终消息保持正常。
+
+下一阶段：MVP 31，让模型调用返回 `Result<ModelOutput, ModelError>`，使网络、认证或模型响应失败成为显式的 Turn 终止路径。

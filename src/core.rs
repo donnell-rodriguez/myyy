@@ -1,9 +1,8 @@
 use crate::history::{ConversationHistory, ConversationItem, TurnAborted};
-use crate::model::{FakeModel, ModelClient, ModelOutput, ModelRequest};
+use crate::model::{FakeModel, ModelClient, ModelOutput, ModelRequest, ModelSession};
+use crate::protocol::CoreEvent;
 use crate::protocol::UserInput;
 use crate::tools::{ToolCallRuntime, ToolRouter};
-// use tokio::time::{Duration, sleep};
-use crate::protocol::CoreEvent;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -77,6 +76,7 @@ impl RegularTask {
         &self,
         session: &mut Session,
         context: &TurnContext,
+        model_session: &mut dyn ModelSession,
         input: Vec<UserInput>,
         cancellation_token: CancellationToken,
         event_tx: &mpsc::UnboundedSender<CoreEvent>,
@@ -105,9 +105,9 @@ impl RegularTask {
             println!("[Core/ModelRequest] input={:#?}", request.input);
             println!("[Core/ModelRequest] tools={:#?}", request.tools);
 
-            //调用模型，拿到结果
-            // 这里的session.model 是任何实现了 ModelClient 的对象
-            let output = session.model.respond(request).await;
+            // 调用当前 Turn 的模型会话，拿到结果。
+            // 循环本身不创建 ModelSession，所以工具执行完成后的第二次模型请求仍然使用同一个对象。
+            let output = model_session.respond(request).await;
             //对于不同的结果做不同的事情
             match output {
                 ModelOutput::AssistantMessage { text } => {
@@ -235,6 +235,9 @@ impl Session {
             turn_id: self.next_turn_id,
             tool_runtime: ToolCallRuntime::new(ToolRouter::new()),
         };
+        let mut model_session = self.model.new_session();
+        println!("[Core/Session] 为 Turn 创建新的 ModelSession");
+
         println!(
             "[Core/Session {}] 创建 TurnContext(turn_id={})",
             self.session_id, turn_context.turn_id
@@ -260,6 +263,8 @@ impl Session {
         _ = regular_task.run(
                     self,
                     &turn_context,
+                    //对盒子内部真实模型会话的可变借用。
+                    model_session.as_mut(),
                     input,
                     task_cancellation_token,
                     &event_tx,
@@ -299,7 +304,7 @@ mod tests {
     use super::ModelRequest;
     use super::Session;
     use crate::history::{ConversationItem, TurnAborted};
-    use crate::model::{ModelClient, ModelFuture, ModelOutput};
+    use crate::model::{ModelClient, ModelFuture, ModelOutput, ModelSession};
     use crate::protocol::{CoreEvent, UserInput};
     use crate::tools::ToolSpec;
     use serde_json::json;
@@ -307,9 +312,17 @@ mod tests {
     use tokio::sync::mpsc;
 
     struct FixedModel;
+    struct FixedModelSession;
 
     impl ModelClient for FixedModel {
-        fn respond<'a>(&'a self, _request: ModelRequest) -> ModelFuture<'a> {
+        fn new_session(&self) -> Box<dyn ModelSession> {
+            Box::new(FixedModelSession)
+        }
+    }
+    // 同一个 Turn 的连续模型请求共享连接状态、请求计数以及未来的路由信息。
+
+    impl ModelSession for FixedModelSession {
+        fn respond<'a>(&'a mut self, _request: ModelRequest) -> ModelFuture<'a> {
             Box::pin(async {
                 ModelOutput::AssistantMessage {
                     text: "来自替代模型".to_string(),

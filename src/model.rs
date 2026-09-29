@@ -28,21 +28,46 @@ pub enum ModelOutput {
 // 不同模型实现产生的 Future 类型可能不同。
 // Box 把它们统一成一种可以放进 trait object 的类型。
 pub type ModelFuture<'a> = Pin<Box<dyn Future<Output = ModelOutput> + Send + 'a>>;
-// 只要某个类型能够接收 ModelRequest 并产生 ModelOutput，它就可以作为模型客户端。
+
+// 长期模型客户端。
+// 它负责为每个 Turn 创建独立的模型会话。
 pub trait ModelClient: Send + Sync {
-    fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a>;
+    fn new_session(&self) -> Box<dyn ModelSession>;
 }
+// 单个 Turn 内的模型会话。
+// 同一个 Turn 中的多次模型请求复用它。
+pub trait ModelSession: Send {
+    fn respond<'a>(&'a mut self, request: ModelRequest) -> ModelFuture<'a>;
+}
+
 pub struct FakeModel;
+
+// 这是单个 Turn 的模型状态。
+struct FakeModelSession {
+    request_count: usize,
+}
 
 impl FakeModel {
     pub fn new() -> Self {
         Self
     }
 }
+
 impl ModelClient for FakeModel {
-    fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
+    fn new_session(&self) -> Box<dyn ModelSession> {
+        Box::new(FakeModelSession { request_count: 0 })
+    }
+}
+
+impl ModelSession for FakeModelSession {
+    fn respond<'a>(&'a mut self, request: ModelRequest) -> ModelFuture<'a> {
+        self.request_count += 1;
+        let request_count = self.request_count;
+
         // 取出最后一个item
         Box::pin(async move {
+            println!("[FakeModelSession] 本 Turn 第 {request_count} 次模型请求");
+
             let Some(last_item) = request.input.last() else {
                 return ModelOutput::AssistantMessage {
                     text: "当前没有可处理的消息".to_string(),
@@ -51,7 +76,7 @@ impl ModelClient for FakeModel {
 
             // 判断最后一个item的情况，分别进行处理， 这里是模拟modeloutput的情况
             match last_item {
-                // 慢工具
+                // wait工具
                 ConversationItem::UserMessage { text } if text.contains("等待") => {
                     ModelOutput::ToolCall {
                         name: "exec_command".to_string(),
