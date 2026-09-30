@@ -43,18 +43,25 @@ pub enum ModelEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelError {
     RequestFailed(String),
-    StreamClosed,
+    StreamFailed(String),
+    StreamClosed(String),
 }
+
 impl fmt::Display for ModelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            //请求根本没有建立成功
             Self::RequestFailed(message) => {
                 write!(f, "模型请求失败：{message}")
             }
-            // channel 已关闭
+            //请求建立成功，也收到了一部分内容，但中途失败
+            Self::StreamFailed(message) => {
+                write!(f, "模型流失败：{message}")
+            }
+            // channel 已关闭 通道关闭，却没有收到完成事件
             // 但是 Core 还没有收到 OutputItemDone
-            Self::StreamClosed => {
-                write!(f, "模型事件流在完成前关闭")
+            Self::StreamClosed(message) => {
+                write!(f, "模型事件流在完成前关闭：{message}")
             }
         }
     }
@@ -88,6 +95,15 @@ pub(crate) fn fake_stream_from_output(output: ModelOutput) -> ModelStream {
         }
     }
     _ = event_tx.send(Ok(ModelEvent::OutputItemDone { output }));
+    event_rx
+}
+
+pub(crate) fn fake_stream_that_fails() -> ModelStream {
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let _ = event_tx.send(Ok(ModelEvent::OutputTextDelta {
+        delta: "部分回答".to_string(),
+    }));
+    let _ = event_tx.send(Err(ModelError::StreamFailed("模拟连接中断".to_string())));
     event_rx
 }
 
@@ -128,6 +144,10 @@ impl ModelSession for FakeModelSession {
             if matches!(last_item, ConversationItem::UserMessage { text } if text.contains("模型失败"))
             {
                 return Err(ModelError::RequestFailed("模拟服务不可用".to_string()));
+            }
+            if matches!(last_item, ConversationItem::UserMessage { text } if text.contains("流中失败"))
+            {
+                return Ok(fake_stream_that_fails());
             }
 
             // 判断最后一个item的情况，分别进行处理， 这里是模拟modeloutput的情况
@@ -190,7 +210,28 @@ impl ModelSession for FakeModelSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelEvent, ModelOutput, fake_stream_from_output};
+    use super::{
+        ModelError, ModelEvent, ModelOutput, fake_stream_from_output, fake_stream_that_fails,
+    };
+
+    #[tokio::test]
+    async fn stream_can_fail_after_partial_delta() {
+        let mut stream = fake_stream_that_fails();
+
+        assert_eq!(
+            stream.recv().await,
+            Some(Ok(ModelEvent::OutputTextDelta {
+                delta: "部分回答".to_string(),
+            }))
+        );
+
+        assert_eq!(
+            stream.recv().await,
+            Some(Err(ModelError::StreamFailed("模拟连接中断".to_string(),)))
+        );
+
+        assert_eq!(stream.recv().await, None);
+    }
 
     #[tokio::test]
     async fn text_deltas_arrive_before_output_done() {

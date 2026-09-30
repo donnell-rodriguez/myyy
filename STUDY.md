@@ -507,3 +507,37 @@ Rust 概念：
 验收结果：`cargo fmt --check` 与 `cargo test` 通过，13 个测试全部成功；`text_deltas_arrive_before_output_done` 验证事件顺序。端到端 `请执行 pwd` 正确完成 ToolCall、ToolResult 回填、第二次模型流、Delta 合并和唯一一次最终展示。
 
 下一阶段：MVP 33，模拟已经产生部分文本后的模型流中途失败，验证 App 丢弃部分流、只发送 `TurnFailed`，且不产生 `AgentMessage` 或 `TurnCompleted`。
+
+## MVP 33：Mid-stream Failure Integrity
+
+阶段类型：正确性（Correctness）与测试（Test）。
+
+目标：模拟模型已经发送部分文本后流中途失败，确保临时 Delta 可以显示，但不能成为正式 Assistant 历史；本轮只能以 `TurnFailed` 终止。
+
+数据流：
+
+```text
+ModelStream
+  -> OutputTextDelta("部分回答")
+  -> StreamFailed("模拟连接中断")
+  -> RegularTask 返回 Err
+  -> Session 清理 ActiveTurn
+  -> App 丢弃部分流
+  -> TurnFailed
+```
+
+被保护的不变量：流中失败后不能再产生 `AgentMessage` 或 `TurnCompleted`；没有收到 `OutputItemDone` 的部分文本不能写入会话历史；失败结束后活动 Turn 必须被清理。
+
+Rust 概念：
+
+- `Result<ModelEvent, ModelError>` 允许事件流在已经产生正常事件后再产生错误。
+- `matches!` 守卫让 FakeModel 根据输入确定性地进入流中失败场景。
+- 测试按顺序消费 channel，直接验证 `TurnStarted -> AgentMessageDelta -> TurnFailed -> channel closed`。
+
+生产源码对应：Codex 的 `ResponseStream` 同样传输 `Result<ResponseEvent>`；Turn 循环把 `Some(Err)` 作为失败，把未收到完成事件的 `None` 作为流提前关闭。教学版本保留了这两类错误的语义区分。
+
+本阶段仍然省略：真实异步生产者、网络到达间隔、bounded channel/backpressure、consumer drop 通知、重试与恢复策略。
+
+验收结果：`cargo fmt --check` 与 `cargo test` 通过，15 个测试全部成功；端到端输入“请模拟流中失败”先显示“部分回答”，随后 App 丢弃该部分内容并只产生 `TurnFailed`，历史中没有 AssistantMessage。
+
+下一阶段：MVP 34，把预先写满 channel 的假流替换为后台异步生产任务，并在消费者丢弃 `ModelStream` 时取消生产者，避免孤儿任务继续生成事件。

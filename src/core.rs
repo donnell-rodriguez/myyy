@@ -127,7 +127,7 @@ impl RegularTask {
                     }
                     // 收到无
                     None => {
-                        return Err(ModelError::StreamClosed);
+                        return Err(ModelError::StreamClosed("中断".to_string()));
                     }
                 }
             };
@@ -539,5 +539,57 @@ mod tests {
             .reserve_turn()
             .await
             .expect("失败后 ActiveTurn 应该已经清理");
+    }
+    #[tokio::test]
+    async fn mid_stream_error_emits_partial_delta_then_turn_failed() {
+        let mut session = Session::new();
+        let control = session.control();
+
+        let cancellation_token = control.reserve_turn().await.expect("应该成功预留 Turn");
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        session
+            .start_turn(
+                vec![UserInput::Text {
+                    text: "请模拟流中失败".to_string(),
+                }],
+                event_tx,
+                cancellation_token,
+            )
+            .await;
+
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(CoreEvent::TurnStarted { turn_id: 1 })
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(CoreEvent::AgentMessageDelta {
+                turn_id: 1,
+                delta,
+            }) if delta == "部分回答"
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(CoreEvent::TurnFailed {
+                turn_id: 1,
+                error,
+            }) if error == "模型流失败：模拟连接中断"
+        ));
+
+        assert!(
+            event_rx.recv().await.is_none(),
+            "流失败后不能出现 AgentMessage 或 TurnCompleted"
+        );
+
+        assert_eq!(
+            session.history.items(),
+            &[ConversationItem::UserMessage {
+                text: "请模拟流中失败".to_string(),
+            }]
+        );
     }
 }
