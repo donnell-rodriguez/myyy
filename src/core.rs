@@ -110,26 +110,31 @@ impl RegularTask {
             let mut model_stream = model_session.stream(request).await?;
             let output = loop {
                 match model_stream.recv().await {
+                    // 从模型当中收到增量
                     Some(Ok(ModelEvent::OutputTextDelta { delta })) => {
                         let _ = event_tx.send(CoreEvent::AgentMessageDelta {
                             turn_id: context.turn_id,
                             delta,
                         });
                     }
+                    // 收到完成
                     Some(Ok(ModelEvent::OutputItemDone { output })) => {
                         break output;
                     }
-
+                    // 收到错误
                     Some(Err(error)) => {
                         return Err(error);
                     }
+                    // 收到无
                     None => {
                         return Err(ModelError::StreamClosed);
                     }
                 }
             };
+
             //对于不同的结果做不同的事情
             match output {
+                // 处理助理信息
                 ModelOutput::AssistantMessage { text } => {
                     // 我们这里不进行打印，而是通过event_tx发送出去, 上面已经增量了，这里表示的就是说是agent消息已经结束了。
                     let _ = event_tx.send(CoreEvent::AgentMessage {
@@ -143,6 +148,7 @@ impl RegularTask {
                         .push(ConversationItem::AssistantMessage { text });
                     break;
                 }
+                //处理工具输出
                 ModelOutput::ToolCall { name, arguments } => {
                     println!(
                         "[ModelOutput::ToolCall] \
