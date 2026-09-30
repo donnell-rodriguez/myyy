@@ -1,5 +1,7 @@
 use crate::history::{ConversationHistory, ConversationItem, TurnAborted};
-use crate::model::{FakeModel, ModelClient, ModelError, ModelOutput, ModelRequest, ModelSession};
+use crate::model::{
+    FakeModel, ModelClient, ModelError, ModelEvent, ModelOutput, ModelRequest, ModelSession,
+};
 use crate::protocol::CoreEvent;
 use crate::protocol::UserInput;
 use crate::tools::{ToolCallRuntime, ToolRouter};
@@ -105,21 +107,30 @@ impl RegularTask {
             println!("[Core/ModelRequest] input={:#?}", request.input);
             println!("[Core/ModelRequest] tools={:#?}", request.tools);
 
-            // 调用当前 Turn 的模型会话，拿到结果。
-            // 循环本身不创建 ModelSession，所以工具执行完成后的第二次模型请求仍然使用同一个对象。
-            let output = model_session.respond(request).await?;
+            let mut model_stream = model_session.stream(request).await?;
+            let output = loop {
+                match model_stream.recv().await {
+                    Some(Ok(ModelEvent::OutputTextDelta { delta })) => {
+                        let _ = event_tx.send(CoreEvent::AgentMessageDelta {
+                            turn_id: context.turn_id,
+                            delta,
+                        });
+                    }
+                    Some(Ok(ModelEvent::OutputItemDone { output })) => {
+                        break output;
+                    }
+
+                    Some(Err(error)) => {
+                        return Err(error);
+                    }
+                    None => {
+                        return Err(ModelError::StreamClosed);
+                    }
+                }
+            };
             //对于不同的结果做不同的事情
             match output {
                 ModelOutput::AssistantMessage { text } => {
-                    // println!("[FinalAssistantMessage] {text}");
-                    // 增量
-                    for character in text.chars() {
-                        let _ = event_tx.send(CoreEvent::AgentMessageDelta {
-                            turn_id: context.turn_id,
-                            delta: character.to_string(),
-                        });
-                        tokio::time::sleep(std::time::Duration::from_millis(35)).await;
-                    }
                     // 我们这里不进行打印，而是通过event_tx发送出去, 上面已经增量了，这里表示的就是说是agent消息已经结束了。
                     let _ = event_tx.send(CoreEvent::AgentMessage {
                         turn_id: context.turn_id,
@@ -317,7 +328,9 @@ mod tests {
     use super::ModelRequest;
     use super::Session;
     use crate::history::{ConversationItem, TurnAborted};
-    use crate::model::{ModelClient, ModelFuture, ModelOutput, ModelSession};
+    use crate::model::{
+        ModelClient, ModelOutput, ModelSession, ModelStreamFuture, fake_stream_from_output,
+    };
     use crate::protocol::{CoreEvent, UserInput};
     use crate::tools::ToolSpec;
     use serde_json::json;
@@ -335,11 +348,11 @@ mod tests {
     // 同一个 Turn 的连续模型请求共享连接状态、请求计数以及未来的路由信息。
 
     impl ModelSession for FixedModelSession {
-        fn respond<'a>(&'a mut self, _request: ModelRequest) -> ModelFuture<'a> {
+        fn stream<'a>(&'a mut self, _request: ModelRequest) -> ModelStreamFuture<'a> {
             Box::pin(async {
-                Ok(ModelOutput::AssistantMessage {
+                Ok(fake_stream_from_output(ModelOutput::AssistantMessage {
                     text: "来自替代模型".to_string(),
-                })
+                }))
             })
         }
     }

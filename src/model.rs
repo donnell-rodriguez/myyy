@@ -3,6 +3,7 @@ use crate::tools::ToolSpec;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use tokio::sync::mpsc;
 // 某一次模型调用看到的完整输入快照。
 // 每次请求模型前，把当前完整 ConversationHistory 复制成一个独立的 ModelRequest，而不是让模型直接借用 Session 内部历史。
 // 让 ModelRequest 除了携带对话历史，还携带当前模型可以调用的工具定义。
@@ -21,10 +22,18 @@ impl ModelRequest {
     }
 }
 // 模型可能返回普通消息，也可能要求调用工具。
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelOutput {
     AssistantMessage { text: String },
     ToolCall { name: String, arguments: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelEvent {
+    //模型刚生成的一小段文本。
+    OutputTextDelta { delta: String },
+    //这次模型输出已经完整，可以进入工具或消息处理
+    OutputItemDone { output: ModelOutput },
 }
 
 // 程序：保存模型失败原因。
@@ -34,6 +43,7 @@ pub enum ModelOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelError {
     RequestFailed(String),
+    StreamClosed,
 }
 impl fmt::Display for ModelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -41,15 +51,21 @@ impl fmt::Display for ModelError {
             Self::RequestFailed(message) => {
                 write!(f, "模型请求失败：{message}")
             }
+            // channel 已关闭
+            // 但是 Core 还没有收到 OutputItemDone
+            Self::StreamClosed => {
+                write!(f, "模型事件流在完成前关闭")
+            }
         }
     }
 }
 impl std::error::Error for ModelError {}
 
-// 不同模型实现产生的 Future 类型可能不同。
-// Box 把它们统一成一种可以放进 trait object 的类型。
-pub type ModelFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<ModelOutput, ModelError>> + Send + 'a>>;
+// 持续接收模型生成事件
+pub type ModelStream = mpsc::UnboundedReceiver<Result<ModelEvent, ModelError>>;
+// 等待模型请求建立
+pub type ModelStreamFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ModelStream, ModelError>> + Send + 'a>>;
 
 // 长期模型客户端。
 // 它负责为每个 Turn 创建独立的模型会话。
@@ -59,7 +75,20 @@ pub trait ModelClient: Send + Sync {
 // 单个 Turn 内的模型会话。
 // 同一个 Turn 中的多次模型请求复用它。
 pub trait ModelSession: Send {
-    fn respond<'a>(&'a mut self, request: ModelRequest) -> ModelFuture<'a>;
+    fn stream<'a>(&'a mut self, request: ModelRequest) -> ModelStreamFuture<'a>;
+}
+
+pub(crate) fn fake_stream_from_output(output: ModelOutput) -> ModelStream {
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    if let ModelOutput::AssistantMessage { text } = &output {
+        for character in text.chars() {
+            let _ = event_tx.send(Ok(ModelEvent::OutputTextDelta {
+                delta: character.to_string(),
+            }));
+        }
+    }
+    _ = event_tx.send(Ok(ModelEvent::OutputItemDone { output }));
+    event_rx
 }
 
 pub struct FakeModel;
@@ -82,7 +111,7 @@ impl ModelClient for FakeModel {
 }
 
 impl ModelSession for FakeModelSession {
-    fn respond<'a>(&'a mut self, request: ModelRequest) -> ModelFuture<'a> {
+    fn stream<'a>(&'a mut self, request: ModelRequest) -> ModelStreamFuture<'a> {
         self.request_count += 1;
         let request_count = self.request_count;
 
@@ -91,9 +120,9 @@ impl ModelSession for FakeModelSession {
             println!("[FakeModelSession] 本 Turn 第 {request_count} 次模型请求");
 
             let Some(last_item) = request.input.last() else {
-                return Ok(ModelOutput::AssistantMessage {
+                return Ok(fake_stream_from_output(ModelOutput::AssistantMessage {
                     text: "当前没有可处理的消息".to_string(),
-                });
+                }));
             };
 
             if matches!(last_item, ConversationItem::UserMessage { text } if text.contains("模型失败"))
@@ -154,7 +183,42 @@ impl ModelSession for FakeModelSession {
                     text: format!("检测到历史中止记录：{}", marker.guidance),
                 },
             };
-            Ok(output)
+            Ok(fake_stream_from_output(output))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ModelEvent, ModelOutput, fake_stream_from_output};
+
+    #[tokio::test]
+    async fn text_deltas_arrive_before_output_done() {
+        let output = ModelOutput::AssistantMessage {
+            text: "好呀".to_string(),
+        };
+
+        let mut stream = fake_stream_from_output(output.clone());
+
+        assert_eq!(
+            stream.recv().await,
+            Some(Ok(ModelEvent::OutputTextDelta {
+                delta: "好".to_string(),
+            },))
+        );
+
+        assert_eq!(
+            stream.recv().await,
+            Some(Ok(ModelEvent::OutputTextDelta {
+                delta: "呀".to_string(),
+            },))
+        );
+
+        assert_eq!(
+            stream.recv().await,
+            Some(Ok(ModelEvent::OutputItemDone { output },))
+        );
+
+        assert_eq!(stream.recv().await, None);
     }
 }

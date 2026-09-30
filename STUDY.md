@@ -473,3 +473,37 @@ Rust 概念：
 验收结果：`cargo fmt --check` 与 `cargo test` 通过，12 个测试全部成功；`model_error_emits_turn_failed_not_completed` 验证错误终止的互斥性及 ActiveTurn 清理。端到端输入“请模拟模型失败”只产生 `TurnStarted` 和 `TurnFailed`。
 
 下一阶段：MVP 32，让 `ModelSession` 返回模型事件流，把文本增量的来源从 Core 字符拆分迁移到模型边界。
+
+## MVP 32：Model Event Stream Boundary
+
+阶段类型：生产收敛（Convergence）。
+
+目标：`ModelSession` 返回 `ModelStream`，文本增量由模型边界产生；Core 只消费并转发 `ModelEvent`，不再拿完整字符串自行拆分。
+
+数据流：
+
+```text
+ModelSession::stream(ModelRequest)
+  -> ModelStream
+  -> OutputTextDelta*
+  -> OutputItemDone(ModelOutput)
+  -> RegularTask
+  -> CoreEvent::AgentMessageDelta / AgentMessage
+  -> App StreamingState
+```
+
+被保护的不变量：所有文本 Delta 必须先于 `OutputItemDone`；只有完整输出到达后才能写入历史并结束采样；事件流若在完成前关闭则产生 `ModelError::StreamClosed`。
+
+Rust 概念：
+
+- `mpsc::UnboundedReceiver<Result<ModelEvent, ModelError>>` 表示可连续接收、且每个事件都可能失败的模型流。
+- `ModelStreamFuture` 区分“等待请求建立”和“持续等待流事件”两个异步阶段。
+- `ModelEvent` enum 把文本增量与完整输出表示为不同的类型化事件。
+
+生产源码对应：Codex 的 `ModelClientSession::stream` 返回 `ResponseStream`；`run_sampling_request` 持续消费 `ResponseEvent`，将 `OutputTextDelta` 转发给客户端，并在终止事件后处理完整输出。
+
+本阶段仍然省略：真实网络到达时间、bounded channel/backpressure、生产者后台任务、consumer drop 通知、流中途错误模拟、响应 ID、usage 和 reasoning 事件。
+
+验收结果：`cargo fmt --check` 与 `cargo test` 通过，13 个测试全部成功；`text_deltas_arrive_before_output_done` 验证事件顺序。端到端 `请执行 pwd` 正确完成 ToolCall、ToolResult 回填、第二次模型流、Delta 合并和唯一一次最终展示。
+
+下一阶段：MVP 33，模拟已经产生部分文本后的模型流中途失败，验证 App 丢弃部分流、只发送 `TurnFailed`，且不产生 `AgentMessage` 或 `TurnCompleted`。
