@@ -5,6 +5,8 @@ use std::future::Future;
 use std::pin::Pin;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+const MODEL_STREAM_CHANNEL_CAPACITY: usize = 1;
 // 某一次模型调用看到的完整输入快照。
 // 每次请求模型前，把当前完整 ConversationHistory 复制成一个独立的 ModelRequest，而不是让模型直接借用 Session 内部历史。
 // 让 ModelRequest 除了携带对话历史，还携带当前模型可以调用的工具定义。
@@ -71,7 +73,8 @@ impl std::error::Error for ModelError {}
 
 // 持续接收模型生成事件，并在消费者离开时通知后台生产者。
 pub struct ModelStream {
-    event_rx: mpsc::UnboundedReceiver<Result<ModelEvent, ModelError>>,
+    // 有界通道让模型生产速度受到 Core 消费速度约束。
+    event_rx: mpsc::Receiver<Result<ModelEvent, ModelError>>,
     consumer_dropped: CancellationToken,
 }
 
@@ -103,20 +106,23 @@ pub trait ModelSession: Send {
 
 // 在独立 Tokio 任务中异步生产模型事件，同时监听消费者取消信号。
 fn spawn_fake_stream(events: Vec<Result<ModelEvent, ModelError>>) -> ModelStream {
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = mpsc::channel(MODEL_STREAM_CHANNEL_CAPACITY);
     let consumer_dropped = CancellationToken::new();
     let producer_cancellation = consumer_dropped.clone();
     tokio::spawn(async move {
         for event in events {
             tokio::select! {
                 biased;
+                // 取消
                 _ = producer_cancellation.cancelled() => {
                     return;
                 }
-                _ = tokio::task::yield_now() => {}
+                // channel 满时在这里等待，直到 Core 消费一个事件。
+                send_result = event_tx.send(event)=>{
+                if send_result.is_err(){
+                    return;
+                }
             }
-            if event_tx.send(event).is_err() {
-                return;
             }
         }
     });
@@ -320,5 +326,38 @@ mod tests {
         drop(stream);
 
         assert!(consumer_dropped.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn bounded_stream_keeps_only_one_unread_event() {
+        let output = ModelOutput::AssistantMessage {
+            text: "好呀".to_string(),
+        };
+
+        let mut stream = fake_stream_from_output(output);
+
+        // 让后台生产任务得到一次运行机会。
+        tokio::task::yield_now().await;
+
+        // 总容量是 1。
+        assert_eq!(stream.event_rx.max_capacity(), 1);
+
+        // 此时只能积压一个未读取事件。
+        assert_eq!(stream.event_rx.len(), 1);
+
+        // 剩余容量为 0，生产者不能继续发送。
+        assert_eq!(stream.event_rx.capacity(), 0);
+
+        assert!(matches!(
+            stream.recv().await,
+            Some(Ok(ModelEvent::OutputTextDelta {
+                delta
+            })) if delta == "好"
+        ));
+
+        // Core 消费第一个事件后，生产者才能发送下一个。
+        tokio::task::yield_now().await;
+
+        assert_eq!(stream.event_rx.len(), 1);
     }
 }

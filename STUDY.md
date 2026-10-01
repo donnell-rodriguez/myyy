@@ -577,3 +577,36 @@ Rust 概念：
 验收结果：`cargo fmt --check` 与 `cargo test` 通过，16 个测试全部成功；`dropping_stream_notifies_background_producer` 确认 Drop 发出取消信号。端到端 `请执行 pwd` 仍完成工具调用、第二次模型请求、流式 Delta 和唯一一次 `TurnCompleted`。
 
 下一阶段：MVP 35，把模型事件通道从无界 channel 改为容量为 1 的 bounded channel，让生产速度受到消费速度约束，并用确定性测试证明背压发生。
+
+## MVP 35：Bounded Model Stream Backpressure
+
+阶段类型：加固（Hardening）与生产收敛（Convergence）。
+
+目标：把模型事件通道改为容量为 1 的 bounded channel；Core 未消费当前事件时，后台模型生产者的下一次发送必须等待，防止事件无限积压。
+
+数据流：
+
+```text
+后台模型生产者
+  -> send(event).await
+  -> bounded channel(capacity = 1)
+  -> ModelStream::recv
+  -> Core
+```
+
+被保护的不变量：模型生产速度不能无限超过 Core 消费速度；channel 满时生产者必须等待，同时仍可响应 `consumer_dropped` 取消信号；原有成功、失败和工具调用路径保持不变。
+
+Rust 概念：
+
+- `mpsc::channel(1)` 创建有界异步通道，替代 `unbounded_channel()`。
+- `mpsc::Sender::send(event).await` 在容量用尽时挂起当前生产任务。
+- `tokio::select!` 同时等待取消与发送完成，使背压等待不会阻断生命周期取消。
+- `Receiver::len`、`capacity` 与 `max_capacity` 让测试直接检查积压状态。
+
+生产源码对应：Codex 使用 `RESPONSE_STREAM_CHANNEL_CAPACITY` 创建 bounded response channel，后台流映射任务通过异步 `send` 把模型事件传给 `ResponseStream`。
+
+本阶段仍然省略：生产容量 1600 的实际选择、真实网络 SSE/WebSocket、响应映射、usage/response ID、速率指标和自适应流控。
+
+验收结果：`cargo fmt --check` 与 `cargo test` 通过，17 个测试全部成功；`bounded_stream_keeps_only_one_unread_event` 验证容量为 1 时只能积压一个事件。端到端 `请执行 pwd` 仍完成工具调用、第二次模型请求、完整流式输出和唯一一次 `TurnCompleted`。
+
+下一阶段：MVP 36，引入独立的 `ResponseCompleted` 事件，把“一个输出项完成”与“整个模型响应完成”分开，避免把 `OutputItemDone` 错当成响应终点。
