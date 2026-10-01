@@ -108,6 +108,8 @@ impl RegularTask {
             println!("[Core/ModelRequest] tools={:#?}", request.tools);
 
             let mut model_stream = model_session.stream(request).await?;
+            // 暂存，但不写入历史
+            let mut completed_output = None;
             let output = loop {
                 match model_stream.recv().await {
                     // 从模型当中收到增量
@@ -119,6 +121,16 @@ impl RegularTask {
                     }
                     // 收到完成
                     Some(Ok(ModelEvent::OutputItemDone { output })) => {
+                        // 只暂存输出项；在整个响应完成前，还不能写入历史。
+                        completed_output = Some(output);
+                    }
+                    // 只有这个事件才能结束整个响应。
+                    Some(Ok(ModelEvent::ResponseCompleted)) => {
+                        let Some(output) = completed_output.take() else {
+                            return Err(ModelError::InvalidResponse(
+                                "ResponseCompleted 前没有 OutputItemDone".to_string(),
+                            ));
+                        };
                         break output;
                     }
                     // 收到错误
@@ -589,6 +601,49 @@ mod tests {
             session.history.items(),
             &[ConversationItem::UserMessage {
                 text: "请模拟流中失败".to_string(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn output_item_done_is_not_response_completion() {
+        let mut session = Session::new();
+        let control = session.control();
+
+        let cancellation_token = control.reserve_turn().await.expect("应该成功预留 Turn");
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        session
+            .start_turn(
+                vec![UserInput::Text {
+                    text: "请模拟输出项后失败".to_string(),
+                }],
+                event_tx,
+                cancellation_token,
+            )
+            .await;
+
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(CoreEvent::TurnStarted { turn_id: 1 })
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(CoreEvent::TurnFailed {
+                turn_id: 1,
+                error
+            }) if error
+                == "模型流失败：响应完成前连接中断"
+        ));
+
+        assert!(event_rx.recv().await.is_none());
+
+        assert_eq!(
+            session.history.items(),
+            &[ConversationItem::UserMessage {
+                text: "请模拟输出项后失败".to_string(),
             }]
         );
     }

@@ -35,8 +35,10 @@ pub enum ModelOutput {
 pub enum ModelEvent {
     //模型刚生成的一小段文本。
     OutputTextDelta { delta: String },
-    //这次模型输出已经完整，可以进入工具或消息处理
+    // 一个输出项完成，但整个响应还没有结束。
     OutputItemDone { output: ModelOutput },
+    // 整个模型响应完成。
+    ResponseCompleted,
 }
 
 // 程序：保存模型失败原因。
@@ -48,6 +50,7 @@ pub enum ModelError {
     RequestFailed(String),
     StreamFailed(String),
     StreamClosed(String),
+    InvalidResponse(String),
 }
 
 impl fmt::Display for ModelError {
@@ -65,6 +68,9 @@ impl fmt::Display for ModelError {
             // 但是 Core 还没有收到 OutputItemDone
             Self::StreamClosed(message) => {
                 write!(f, "模型事件流在完成前关闭：{message}")
+            }
+            Self::InvalidResponse(message) => {
+                write!(f, "模型响应协议错误：{message}")
             }
         }
     }
@@ -135,6 +141,10 @@ fn spawn_fake_stream(events: Vec<Result<ModelEvent, ModelError>>) -> ModelStream
 // 成功的部分
 pub(crate) fn fake_stream_from_output(output: ModelOutput) -> ModelStream {
     let mut events = Vec::new();
+    // 现在成功事件顺序是：
+    // OutputTextDelta*
+    // OutputItemDone
+    // ResponseCompleted
     if let ModelOutput::AssistantMessage { text } = &output {
         for character in text.chars() {
             events.push(Ok(ModelEvent::OutputTextDelta {
@@ -143,6 +153,7 @@ pub(crate) fn fake_stream_from_output(output: ModelOutput) -> ModelStream {
         }
     }
     events.push(Ok(ModelEvent::OutputItemDone { output }));
+    events.push(Ok(ModelEvent::ResponseCompleted));
     spawn_fake_stream(events)
 }
 
@@ -154,6 +165,16 @@ pub(crate) fn fake_stream_that_fails() -> ModelStream {
         }),
         // 失败的部分
         Err(ModelError::StreamFailed("模拟连接中断".to_string())),
+    ])
+}
+pub(crate) fn fake_stream_that_fails_after_item() -> ModelStream {
+    spawn_fake_stream(vec![
+        Ok(ModelEvent::OutputItemDone {
+            output: ModelOutput::AssistantMessage {
+                text: "不能提交到历史".to_string(),
+            },
+        }),
+        Err(ModelError::StreamFailed("响应完成前连接中断".to_string())),
     ])
 }
 
@@ -198,6 +219,10 @@ impl ModelSession for FakeModelSession {
             if matches!(last_item, ConversationItem::UserMessage { text } if text.contains("流中失败"))
             {
                 return Ok(fake_stream_that_fails());
+            }
+            if matches!(last_item, ConversationItem::UserMessage { text } if text.contains("输出项后失败"))
+            {
+                return Ok(fake_stream_that_fails_after_item());
             }
 
             // 判断最后一个item的情况，分别进行处理， 这里是模拟modeloutput的情况
@@ -309,6 +334,8 @@ mod tests {
             stream.recv().await,
             Some(Ok(ModelEvent::OutputItemDone { output },))
         );
+
+        assert_eq!(stream.recv().await, Some(Ok(ModelEvent::ResponseCompleted)));
 
         assert_eq!(stream.recv().await, None);
     }

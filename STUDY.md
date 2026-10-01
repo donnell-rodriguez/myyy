@@ -610,3 +610,36 @@ Rust 概念：
 验收结果：`cargo fmt --check` 与 `cargo test` 通过，17 个测试全部成功；`bounded_stream_keeps_only_one_unread_event` 验证容量为 1 时只能积压一个事件。端到端 `请执行 pwd` 仍完成工具调用、第二次模型请求、完整流式输出和唯一一次 `TurnCompleted`。
 
 下一阶段：MVP 36，引入独立的 `ResponseCompleted` 事件，把“一个输出项完成”与“整个模型响应完成”分开，避免把 `OutputItemDone` 错当成响应终点。
+
+## MVP 36：Response Completion Boundary
+
+阶段类型：正确性（Correctness）与生产收敛（Convergence）。
+
+目标：把“一个输出项完成”与“整个模型响应完成”表示为两个不同事件；Core 先暂存完整输出，只有收到 `ResponseCompleted` 后才允许提交历史并继续处理。
+
+数据流：
+
+```text
+OutputTextDelta*
+  -> OutputItemDone
+  -> Core 暂存 ModelOutput
+  -> ResponseCompleted
+  -> 正式处理输出并写入历史
+```
+
+被保护的不变量：`OutputItemDone` 本身不能代表一次响应成功；如果它与 `ResponseCompleted` 之间发生错误，本轮必须产生 `TurnFailed`，暂存的 Assistant 输出不能进入正式会话历史。
+
+Rust 概念：
+
+- `Option<ModelOutput>` 表达“输出项可能已经完成，但响应尚未完成”的中间状态。
+- `Option::take` 取走暂存值并把原位置恢复成 `None`。
+- `let Some(output) = ... else` 在响应缺少完整输出时返回类型化协议错误。
+- `ModelError::InvalidResponse` 区分模型传输失败和事件序列本身不合法。
+
+生产源码对应：Codex 在 `codex-rs/core/src/client.rs` 中分别映射 `ResponseEvent::OutputItemDone` 与 `ResponseEvent::Completed`；`codex-rs/core/src/session/turn.rs` 也分别处理输出项完成和响应完成，不能把两者视为同一个边界。
+
+本阶段仍然省略：`item_id`、`call_id`、`response_id`、多个输出项、usage、真实 SSE/WebSocket 传输以及不同输出项之间的关联校验。
+
+验收结果：`cargo fmt --check` 与 `cargo test` 通过，18 个测试全部成功；端到端 `请执行 pwd` 仍完整执行工具回路并只产生一次 `TurnCompleted`；输入“请模拟输出项后失败”只产生 `TurnStarted` 与 `TurnFailed`，不会写入 Assistant 历史。
+
+下一阶段：MVP 37，为模型增量和输出项完成事件加入 `item_id`，用确定性失败测试阻止不同输出项的事件被错误拼接。
