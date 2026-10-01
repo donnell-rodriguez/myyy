@@ -4,6 +4,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 // 某一次模型调用看到的完整输入快照。
 // 每次请求模型前，把当前完整 ConversationHistory 复制成一个独立的 ModelRequest，而不是让模型直接借用 Session 内部历史。
 // 让 ModelRequest 除了携带对话历史，还携带当前模型可以调用的工具定义。
@@ -68,8 +69,23 @@ impl fmt::Display for ModelError {
 }
 impl std::error::Error for ModelError {}
 
-// 持续接收模型生成事件
-pub type ModelStream = mpsc::UnboundedReceiver<Result<ModelEvent, ModelError>>;
+// 持续接收模型生成事件，并在消费者离开时通知后台生产者。
+pub struct ModelStream {
+    event_rx: mpsc::UnboundedReceiver<Result<ModelEvent, ModelError>>,
+    consumer_dropped: CancellationToken,
+}
+
+impl ModelStream {
+    pub async fn recv(&mut self) -> Option<Result<ModelEvent, ModelError>> {
+        self.event_rx.recv().await
+    }
+}
+impl Drop for ModelStream {
+    fn drop(&mut self) {
+        self.consumer_dropped.cancel();
+    }
+}
+
 // 等待模型请求建立
 pub type ModelStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ModelStream, ModelError>> + Send + 'a>>;
@@ -85,26 +101,54 @@ pub trait ModelSession: Send {
     fn stream<'a>(&'a mut self, request: ModelRequest) -> ModelStreamFuture<'a>;
 }
 
-pub(crate) fn fake_stream_from_output(output: ModelOutput) -> ModelStream {
+// 在独立 Tokio 任务中异步生产模型事件，同时监听消费者取消信号。
+fn spawn_fake_stream(events: Vec<Result<ModelEvent, ModelError>>) -> ModelStream {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let consumer_dropped = CancellationToken::new();
+    let producer_cancellation = consumer_dropped.clone();
+    tokio::spawn(async move {
+        for event in events {
+            tokio::select! {
+                biased;
+                _ = producer_cancellation.cancelled() => {
+                    return;
+                }
+                _ = tokio::task::yield_now() => {}
+            }
+            if event_tx.send(event).is_err() {
+                return;
+            }
+        }
+    });
+    ModelStream {
+        event_rx,
+        consumer_dropped,
+    }
+}
+
+// 成功的部分
+pub(crate) fn fake_stream_from_output(output: ModelOutput) -> ModelStream {
+    let mut events = Vec::new();
     if let ModelOutput::AssistantMessage { text } = &output {
         for character in text.chars() {
-            let _ = event_tx.send(Ok(ModelEvent::OutputTextDelta {
+            events.push(Ok(ModelEvent::OutputTextDelta {
                 delta: character.to_string(),
             }));
         }
     }
-    _ = event_tx.send(Ok(ModelEvent::OutputItemDone { output }));
-    event_rx
+    events.push(Ok(ModelEvent::OutputItemDone { output }));
+    spawn_fake_stream(events)
 }
 
 pub(crate) fn fake_stream_that_fails() -> ModelStream {
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let _ = event_tx.send(Ok(ModelEvent::OutputTextDelta {
-        delta: "部分回答".to_string(),
-    }));
-    let _ = event_tx.send(Err(ModelError::StreamFailed("模拟连接中断".to_string())));
-    event_rx
+    spawn_fake_stream(vec![
+        // 部分回答
+        Ok(ModelEvent::OutputTextDelta {
+            delta: "部分回答".to_string(),
+        }),
+        // 失败的部分
+        Err(ModelError::StreamFailed("模拟连接中断".to_string())),
+    ])
 }
 
 pub struct FakeModel;
@@ -261,5 +305,20 @@ mod tests {
         );
 
         assert_eq!(stream.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_notifies_background_producer() {
+        let stream = fake_stream_from_output(ModelOutput::AssistantMessage {
+            text: "不会被继续消费".to_string(),
+        });
+
+        let consumer_dropped = stream.consumer_dropped.clone();
+
+        assert!(!consumer_dropped.is_cancelled());
+
+        drop(stream);
+
+        assert!(consumer_dropped.is_cancelled());
     }
 }

@@ -541,3 +541,39 @@ Rust 概念：
 验收结果：`cargo fmt --check` 与 `cargo test` 通过，15 个测试全部成功；端到端输入“请模拟流中失败”先显示“部分回答”，随后 App 丢弃该部分内容并只产生 `TurnFailed`，历史中没有 AssistantMessage。
 
 下一阶段：MVP 34，把预先写满 channel 的假流替换为后台异步生产任务，并在消费者丢弃 `ModelStream` 时取消生产者，避免孤儿任务继续生成事件。
+
+## MVP 34：Async Model Producer Lifecycle
+
+阶段类型：生产收敛（Convergence）与生命周期正确性（Correctness）。
+
+目标：把模型事件生产迁移到独立 Tokio 任务；`ModelStream` 同时拥有事件接收端与消费者退出令牌，流被丢弃时通知后台生产者停止。
+
+数据流：
+
+```text
+tokio::spawn 后台生产者
+  -> ModelEvent channel
+  -> ModelStream::recv
+  -> Core
+
+ModelStream::drop
+  -> consumer_dropped.cancel()
+  -> 后台生产者退出
+```
+
+被保护的不变量：消费者不再读取模型流后，后台生产任务必须能感知退出，不能成为继续工作的孤儿任务；原有成功流、流中失败和工具调用路径必须保持不变。
+
+Rust 概念：
+
+- `tokio::spawn(async move { ... })` 为事件生产建立独立异步任务，并把生产端与事件所有权移入任务。
+- `ModelStream` 从接收器类型别名升级为拥有接收器和取消令牌的结构体。
+- `Drop` 在流离开作用域时同步触发 `CancellationToken::cancel()`。
+- `tokio::select! { biased; ... }` 在取消与继续生产同时就绪时优先处理取消。
+
+生产源码对应：Codex 的 `ResponseStream` 持有 bounded channel 接收端和 `consumer_dropped`；`Drop` 取消令牌，后台映射任务同时等待上游模型事件与消费者退出。
+
+本阶段仍然省略：bounded channel/backpressure、真实网络流、响应映射、usage/response ID、生产任务结果观测和重试策略。
+
+验收结果：`cargo fmt --check` 与 `cargo test` 通过，16 个测试全部成功；`dropping_stream_notifies_background_producer` 确认 Drop 发出取消信号。端到端 `请执行 pwd` 仍完成工具调用、第二次模型请求、流式 Delta 和唯一一次 `TurnCompleted`。
+
+下一阶段：MVP 35，把模型事件通道从无界 channel 改为容量为 1 的 bounded channel，让生产速度受到消费速度约束，并用确定性测试证明背压发生。
