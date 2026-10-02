@@ -7,6 +7,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const MODEL_STREAM_CHANNEL_CAPACITY: usize = 1;
+const FAKE_ITEM_ID: &str = "item-1";
+
 // 某一次模型调用看到的完整输入快照。
 // 每次请求模型前，把当前完整 ConversationHistory 复制成一个独立的 ModelRequest，而不是让模型直接借用 Session 内部历史。
 // 让 ModelRequest 除了携带对话历史，还携带当前模型可以调用的工具定义。
@@ -33,10 +35,19 @@ pub enum ModelOutput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelEvent {
-    //模型刚生成的一小段文本。
-    OutputTextDelta { delta: String },
+    // 一个输出项开始，后续增量属于这个 item_id。
+    OutputItemStarted {
+        item_id: String,
+    },
+    // 当前活动输出项刚生成的一小段文本，item_id 由开始事件建立。
+    OutputTextDelta {
+        delta: String,
+    },
     // 一个输出项完成，但整个响应还没有结束。
-    OutputItemDone { output: ModelOutput },
+    OutputItemDone {
+        item_id: String,
+        output: ModelOutput,
+    },
     // 整个模型响应完成。
     ResponseCompleted,
 }
@@ -140,8 +151,11 @@ fn spawn_fake_stream(events: Vec<Result<ModelEvent, ModelError>>) -> ModelStream
 
 // 成功的部分
 pub(crate) fn fake_stream_from_output(output: ModelOutput) -> ModelStream {
-    let mut events = Vec::new();
+    let mut events = vec![Ok(ModelEvent::OutputItemStarted {
+        item_id: FAKE_ITEM_ID.to_string(),
+    })];
     // 现在成功事件顺序是：
+    // OutputItemStarted
     // OutputTextDelta*
     // OutputItemDone
     // ResponseCompleted
@@ -152,13 +166,19 @@ pub(crate) fn fake_stream_from_output(output: ModelOutput) -> ModelStream {
             }));
         }
     }
-    events.push(Ok(ModelEvent::OutputItemDone { output }));
+    events.push(Ok(ModelEvent::OutputItemDone {
+        item_id: FAKE_ITEM_ID.to_string(),
+        output,
+    }));
     events.push(Ok(ModelEvent::ResponseCompleted));
     spawn_fake_stream(events)
 }
 
 pub(crate) fn fake_stream_that_fails() -> ModelStream {
     spawn_fake_stream(vec![
+        Ok(ModelEvent::OutputItemStarted {
+            item_id: FAKE_ITEM_ID.to_string(),
+        }),
         // 部分回答
         Ok(ModelEvent::OutputTextDelta {
             delta: "部分回答".to_string(),
@@ -169,12 +189,34 @@ pub(crate) fn fake_stream_that_fails() -> ModelStream {
 }
 pub(crate) fn fake_stream_that_fails_after_item() -> ModelStream {
     spawn_fake_stream(vec![
+        Ok(ModelEvent::OutputItemStarted {
+            item_id: FAKE_ITEM_ID.to_string(),
+        }),
         Ok(ModelEvent::OutputItemDone {
+            item_id: FAKE_ITEM_ID.to_string(),
             output: ModelOutput::AssistantMessage {
                 text: "不能提交到历史".to_string(),
             },
         }),
         Err(ModelError::StreamFailed("响应完成前连接中断".to_string())),
+    ])
+}
+
+pub(crate) fn fake_stream_with_mismatched_item_ids() -> ModelStream {
+    spawn_fake_stream(vec![
+        Ok(ModelEvent::OutputItemStarted {
+            item_id: "item-1".to_string(),
+        }),
+        Ok(ModelEvent::OutputTextDelta {
+            delta: "不能提交到历史".to_string(),
+        }),
+        Ok(ModelEvent::OutputItemDone {
+            item_id: "item-2".to_string(),
+            output: ModelOutput::AssistantMessage {
+                text: "不能提交到历史".to_string(),
+            },
+        }),
+        Ok(ModelEvent::ResponseCompleted),
     ])
 }
 
@@ -224,7 +266,10 @@ impl ModelSession for FakeModelSession {
             {
                 return Ok(fake_stream_that_fails_after_item());
             }
-
+            if matches!(last_item, ConversationItem::UserMessage { text } if text.contains("输出项关联失败"))
+            {
+                return Ok(fake_stream_with_mismatched_item_ids());
+            }
             // 判断最后一个item的情况，分别进行处理， 这里是模拟modeloutput的情况
             let output = match last_item {
                 // wait工具
@@ -285,6 +330,8 @@ impl ModelSession for FakeModelSession {
 
 #[cfg(test)]
 mod tests {
+    use crate::model::FAKE_ITEM_ID;
+
     use super::{
         ModelError, ModelEvent, ModelOutput, fake_stream_from_output, fake_stream_that_fails,
     };
@@ -292,7 +339,12 @@ mod tests {
     #[tokio::test]
     async fn stream_can_fail_after_partial_delta() {
         let mut stream = fake_stream_that_fails();
-
+        assert_eq!(
+            stream.recv().await,
+            Some(Ok(ModelEvent::OutputItemStarted {
+                item_id: FAKE_ITEM_ID.to_string()
+            }))
+        );
         assert_eq!(
             stream.recv().await,
             Some(Ok(ModelEvent::OutputTextDelta {
@@ -318,6 +370,12 @@ mod tests {
 
         assert_eq!(
             stream.recv().await,
+            Some(Ok(ModelEvent::OutputItemStarted {
+                item_id: FAKE_ITEM_ID.to_string()
+            }))
+        );
+        assert_eq!(
+            stream.recv().await,
             Some(Ok(ModelEvent::OutputTextDelta {
                 delta: "好".to_string(),
             },))
@@ -332,7 +390,10 @@ mod tests {
 
         assert_eq!(
             stream.recv().await,
-            Some(Ok(ModelEvent::OutputItemDone { output },))
+            Some(Ok(ModelEvent::OutputItemDone {
+                item_id: FAKE_ITEM_ID.to_string(),
+                output
+            }))
         );
 
         assert_eq!(stream.recv().await, Some(Ok(ModelEvent::ResponseCompleted)));
@@ -377,9 +438,9 @@ mod tests {
 
         assert!(matches!(
             stream.recv().await,
-            Some(Ok(ModelEvent::OutputTextDelta {
-                delta
-            })) if delta == "好"
+            Some(Ok(ModelEvent::OutputItemStarted {
+                item_id
+            })) if item_id == FAKE_ITEM_ID.to_string()
         ));
 
         // Core 消费第一个事件后，生产者才能发送下一个。

@@ -643,3 +643,35 @@ Rust 概念：
 验收结果：`cargo fmt --check` 与 `cargo test` 通过，18 个测试全部成功；端到端 `请执行 pwd` 仍完整执行工具回路并只产生一次 `TurnCompleted`；输入“请模拟输出项后失败”只产生 `TurnStarted` 与 `TurnFailed`，不会写入 Assistant 历史。
 
 下一阶段：MVP 37，为模型增量和输出项完成事件加入 `item_id`，用确定性失败测试阻止不同输出项的事件被错误拼接。
+
+## MVP 37：Output Item Identity
+
+阶段类型：正确性（Correctness）与协议收敛（Convergence）。
+
+目标：为流式输出建立 `item_id` 身份边界；Core 在 `OutputItemStarted` 时记录当前活动项，在 `OutputItemDone` 时校验完成事件仍属于同一个输出项。
+
+数据流：
+
+```text
+OutputItemStarted(item-1)
+  -> OutputTextDelta*
+  -> OutputItemDone(item-1)
+  -> ResponseCompleted
+```
+
+被保护的不变量：没有活动输出项时不能接收文本增量或完成事件；`OutputItemDone` 的 ID 必须与当前活动项一致；ID 错配必须产生 `TurnFailed`，部分文本和完整输出都不能进入正式 Assistant 历史。
+
+Rust 概念：
+
+- `Option<String>` 表示当前是否存在活动输出项，并保存其身份。
+- `Option::replace` 在开始事件到来时写入新 ID，同时检测旧输出项是否仍未结束。
+- `Option::take` 在完成事件到来时取出并清空活动 ID。
+- `format!` 把实际的开始 ID 和完成 ID 写入类型化协议错误。
+
+生产源码对应（验证版本 `94174e44cb`）：Codex 在 `codex-rs/core/src/session/turn.rs` 的 `ResponseEvent::OutputItemAdded` 分支建立 `active_item`，文本 Delta 从活动项取得 `item_id`，`OutputItemDone` 分支通过 `active_item.take()` 结束该输出项生命周期。
+
+本阶段仍然省略：`response_id`、`call_id`、同一响应的多个语义输出项、每个 item 独立的流式解析器、reasoning/usage 事件以及真实 SSE/WebSocket 传输。
+
+验收结果：`cargo fmt --check`、`cargo test` 与 `git diff --check` 通过，19 个测试全部成功；端到端输入“请模拟输出项关联失败”先产生临时 Delta，随后丢弃部分流并以 `TurnFailed` 结束，历史中没有 AssistantMessage。
+
+下一阶段：MVP 38，引入 `ResponseCreated { response_id }` 与带 ID 的 `ResponseCompleted`，防止开始与完成事件来自不同模型响应。

@@ -110,17 +110,41 @@ impl RegularTask {
             let mut model_stream = model_session.stream(request).await?;
             // 暂存，但不写入历史
             let mut completed_output = None;
+            let mut active_item_id = None;
             let output = loop {
                 match model_stream.recv().await {
+                    // 开始
+                    Some(Ok(ModelEvent::OutputItemStarted { item_id })) => {
+                        if active_item_id.replace(item_id).is_some() {
+                            return Err(ModelError::InvalidResponse(
+                                "上一个输出项尚未完成，又开始了新输出项".to_string(),
+                            ));
+                        }
+                    }
                     // 从模型当中收到增量
                     Some(Ok(ModelEvent::OutputTextDelta { delta })) => {
+                        if active_item_id.is_none() {
+                            return Err(ModelError::InvalidResponse(
+                                "OutputTextDelta 前没有 OutputItemStarted".to_string(),
+                            ));
+                        }
                         let _ = event_tx.send(CoreEvent::AgentMessageDelta {
                             turn_id: context.turn_id,
                             delta,
                         });
                     }
                     // 收到完成
-                    Some(Ok(ModelEvent::OutputItemDone { output })) => {
+                    Some(Ok(ModelEvent::OutputItemDone { item_id, output })) => {
+                        let Some(active_item_id) = active_item_id.take() else {
+                            return Err(ModelError::InvalidResponse(
+                                "OutputItemDone 前没有 OutputItemStarted".to_string(),
+                            ));
+                        };
+                        if active_item_id != item_id {
+                            return Err(ModelError::InvalidResponse(format!(
+                                "完成的是 {item_id}，但当前输出项是 {active_item_id}"
+                            )));
+                        }
                         // 只暂存输出项；在整个响应完成前，还不能写入历史。
                         completed_output = Some(output);
                     }
@@ -644,6 +668,56 @@ mod tests {
             session.history.items(),
             &[ConversationItem::UserMessage {
                 text: "请模拟输出项后失败".to_string(),
+            }]
+        );
+    }
+    #[tokio::test]
+    async fn mismatched_item_ids_fail_the_turn() {
+        let mut session = Session::new();
+        let control = session.control();
+
+        let cancellation_token = control.reserve_turn().await.expect("应该成功预留 Turn");
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        session
+            .start_turn(
+                vec![UserInput::Text {
+                    text: "请模拟输出项关联失败".to_string(),
+                }],
+                event_tx,
+                cancellation_token,
+            )
+            .await;
+
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(CoreEvent::TurnStarted { turn_id: 1 })
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(CoreEvent::AgentMessageDelta {
+                turn_id: 1,
+                delta
+            }) if delta == "不能提交到历史"
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(CoreEvent::TurnFailed {
+                turn_id: 1,
+                error
+            }) if error
+                == "模型响应协议错误：完成的是 item-2，但当前输出项是 item-1"
+        ));
+
+        assert!(event_rx.recv().await.is_none());
+
+        assert_eq!(
+            session.history.items(),
+            &[ConversationItem::UserMessage {
+                text: "请模拟输出项关联失败".to_string(),
             }]
         );
     }
